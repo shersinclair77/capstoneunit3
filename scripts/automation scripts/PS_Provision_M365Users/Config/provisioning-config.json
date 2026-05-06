@@ -1,0 +1,37 @@
+{
+  "m365": {
+    "tenantId": "YOUR_TENANT_ID",
+    "clientId": "YOUR_CLIENT_ID",
+    "clientSecret": "YOUR_CLIENT_SECRET",
+    "environment": "Production"
+  },
+  "mfa": {
+    "enabled": true,
+    "methods": [
+      "MicrosoftAuthenticator",
+      "PhoneAuthentication"
+    ],
+    "enforcementLevel": "Required"
+  },
+  "licensing": {
+    "defaultSku": "ENTERPRISEPACK",
+    "availableSkus": [
+      "ENTERPRISEPACK",
+      "ENTERPRISEPREMIUM",
+      "BUSINESS_ESSENTIALS"
+    ]
+  },
+  "logging": {
+    "enabled": true,
+    "logLevel": "Verbose",
+    "logPath": "./logs",
+    "retentionDays": 90
+  },
+  "provisioning": {
+    "forceChangePasswordOnFirstLogin": true,
+    "enforceMFAOnFirstLogin": false,
+    "sendWelcomeEmail": true,
+    "batchSize": 10,
+    "delayBetweenUsers": 3000
+  }
+}

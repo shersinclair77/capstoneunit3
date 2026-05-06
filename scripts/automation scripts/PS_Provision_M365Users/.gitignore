@@ -1,0 +1,40 @@
+# Logs
+logs/
+*.log
+*.csv.log
+
+# Config with sensitive data
+config/provisioning-config.json
+!config/provisioning-config.json.example
+
+# Audit logs
+*_audit_*.csv
+
+# User data
+config/users.csv
+
+# IDE
+.vscode/
+.idea/
+*.code-workspace
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Temporary files
+*.tmp
+*.bak
+*.swp
+*~
+
+# Python
+__pycache__/
+*.pyc
+
+# Node
+node_modules/
+
+# PowerShell
+*.psd1
+*.psm1.bak
