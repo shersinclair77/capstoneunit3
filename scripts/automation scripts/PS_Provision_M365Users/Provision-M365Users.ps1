@@ -6,7 +6,7 @@ param(
     [string]$LogPath = ".\logs",
     
     [Parameter(Mandatory=$false)]
-    [switch]$WhatIf
+    [switch]$WhatIfMode
 )
 
 # Import required modules
@@ -49,7 +49,7 @@ function Connect-ToM365 {
         Write-Log "Successfully connected to Microsoft Graph"
         
         # Connect to Exchange Online
-        Connect-ExchangeOnline -ErrorAction Stop
+        Connect-ExchangeOnline -WarningAction SilentlyContinue -ErrorAction Stop
         Write-Log "Successfully connected to Exchange Online"
         
         return $true
@@ -63,7 +63,10 @@ function Connect-ToM365 {
 function New-M365User {
     param(
         [Parameter(Mandatory=$true)]
-        [hashtable]$UserData
+        [hashtable]$UserData,
+        
+        [Parameter(Mandatory=$false)]
+        [bool]$WhatIfMode = $false
     )
     
     $userPrincipalName = $UserData.UserPrincipalName
@@ -75,6 +78,11 @@ function New-M365User {
     
     try {
         Write-Log "Creating user: $userPrincipalName"
+        
+        if ($WhatIfMode) {
+            Write-Log "WhatIf: Would create user $userPrincipalName"
+            return @{ Id = "WhatIf-$userPrincipalName"; UserPrincipalName = $userPrincipalName }
+        }
         
         $passwordProfile = @{
             Password                             = (New-Guid).ToString() + "aA1!"
@@ -96,7 +104,9 @@ function New-M365User {
         Write-Log "User created successfully: $($user.Id)"
         
         # Add additional properties
-        Update-MgUser -UserId $user.Id -Department $department | Out-Null
+        if ($department) {
+            Update-MgUser -UserId $user.Id -Department $department | Out-Null
+        }
         
         # Log to audit
         Add-AuditLogEntry -Action "UserCreated" -User $userPrincipalName -Status "Success" -Details "User account provisioned"
@@ -116,11 +126,19 @@ function Enable-UserMFA {
         [string]$UserPrincipalName,
         
         [Parameter(Mandatory=$false)]
-        [string]$MFAMethod = "Microsoft Authenticator"
+        [string]$MFAMethod = "Microsoft Authenticator",
+        
+        [Parameter(Mandatory=$false)]
+        [bool]$WhatIfMode = $false
     )
     
     try {
         Write-Log "Enabling MFA for user: $UserPrincipalName using $MFAMethod"
+        
+        if ($WhatIfMode) {
+            Write-Log "WhatIf: Would enable MFA for $UserPrincipalName"
+            return $true
+        }
         
         # Get user
         $user = Get-MgUser -Filter "userPrincipalName eq '$UserPrincipalName'" -ErrorAction Stop
@@ -146,18 +164,26 @@ function Assign-M365License {
         [string]$UserPrincipalName,
         
         [Parameter(Mandatory=$true)]
-        [string]$LicenseSku
+        [string]$LicenseSku,
+        
+        [Parameter(Mandatory=$false)]
+        [bool]$WhatIfMode = $false
     )
     
     try {
         Write-Log "Assigning license $LicenseSku to user: $UserPrincipalName"
+        
+        if ($WhatIfMode) {
+            Write-Log "WhatIf: Would assign license $LicenseSku to $UserPrincipalName"
+            return $true
+        }
         
         $user = Get-MgUser -Filter "userPrincipalName eq '$UserPrincipalName'" -ErrorAction Stop
         
         # Get available license plans
         $allSubscribedSkus = Get-MgSubscribedSku -Filter "skuPartNumber eq '$LicenseSku'" -ErrorAction Stop
         
-        if ($allSubscribedSkus.Count -eq 0) {
+        if ($null -eq $allSubscribedSkus -or $allSubscribedSkus.Count -eq 0) {
             throw "License SKU not found: $LicenseSku"
         }
         
@@ -190,11 +216,19 @@ function Assign-M365License {
 function Enable-UserMailbox {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$UserPrincipalName
+        [string]$UserPrincipalName,
+        
+        [Parameter(Mandatory=$false)]
+        [bool]$WhatIfMode = $false
     )
     
     try {
         Write-Log "Creating mailbox for: $UserPrincipalName"
+        
+        if ($WhatIfMode) {
+            Write-Log "WhatIf: Would create mailbox for $UserPrincipalName"
+            return $true
+        }
         
         # The mailbox is automatically created when user is licensed
         Start-Sleep -Seconds 5
@@ -221,7 +255,10 @@ function Enable-UserMailbox {
 function Provision-Users {
     param(
         [Parameter(Mandatory=$true)]
-        [string]$CsvPath
+        [string]$CsvPath,
+        
+        [Parameter(Mandatory=$false)]
+        [bool]$WhatIfMode = $false
     )
     
     # Validate CSV file exists
@@ -233,7 +270,15 @@ function Provision-Users {
     # Import CSV data
     try {
         $users = Import-Csv -Path $CsvPath -ErrorAction Stop
-        Write-Log "Imported $($users.Count) users from CSV"
+        
+        # Handle single user case (where Count doesn't exist)
+        if ($null -eq $users) {
+            Write-Log "No users found in CSV" "ERROR"
+            return $false
+        }
+        
+        $userCount = if ($users -is [array]) { $users.Count } else { 1 }
+        Write-Log "Imported $userCount users from CSV"
     } catch {
         Write-Log "Failed to import CSV: $_" "ERROR"
         return $false
@@ -245,8 +290,15 @@ function Provision-Users {
     foreach ($user in $users) {
         Write-Log "------- Processing user: $($user.UserPrincipalName) -------"
         
+        # Validate required fields
+        if (-not $user.UserPrincipalName) {
+            Write-Log "Skipping user: UserPrincipalName is missing" "WARNING"
+            $failureCount++
+            continue
+        }
+        
         # Create user
-        $newUser = New-M365User -UserData $user
+        $newUser = New-M365User -UserData $user -WhatIfMode $WhatIfMode
         
         if ($newUser) {
             $successCount++
@@ -255,15 +307,15 @@ function Provision-Users {
             Start-Sleep -Seconds 3
             
             # Enable MFA
-            $mfaEnabled = Enable-UserMFA -UserPrincipalName $user.UserPrincipalName
+            $mfaEnabled = Enable-UserMFA -UserPrincipalName $user.UserPrincipalName -WhatIfMode $WhatIfMode
             
             # Assign license
             if ($user.LicenseSku) {
-                $licenseAssigned = Assign-M365License -UserPrincipalName $user.UserPrincipalName -LicenseSku $user.LicenseSku
+                $licenseAssigned = Assign-M365License -UserPrincipalName $user.UserPrincipalName -LicenseSku $user.LicenseSku -WhatIfMode $WhatIfMode
             }
             
             # Enable mailbox
-            $mailboxEnabled = Enable-UserMailbox -UserPrincipalName $user.UserPrincipalName
+            $mailboxEnabled = Enable-UserMailbox -UserPrincipalName $user.UserPrincipalName -WhatIfMode $WhatIfMode
             
         } else {
             $failureCount++
@@ -272,10 +324,13 @@ function Provision-Users {
     
     # Summary
     Write-Log "===== PROVISIONING SUMMARY ====="
-    Write-Log "Total Users: $($users.Count)"
+    Write-Log "Total Users: $userCount"
     Write-Log "Successful: $successCount"
     Write-Log "Failed: $failureCount"
     Write-Log "Audit Log: $auditFile"
+    if ($WhatIfMode) {
+        Write-Log "Script ran in WhatIf mode - no changes were made"
+    }
     
     return $true
 }
@@ -285,12 +340,16 @@ Write-Log "Starting M365 User Provisioning Script"
 Write-Log "CSV File: $CsvFilePath"
 Write-Log "Log Directory: $LogPath"
 
+if ($WhatIfMode) {
+    Write-Log "Script is running in WhatIf mode" "WARNING"
+}
+
 if (-not (Connect-ToM365)) {
     Write-Log "Script terminated due to connection failure" "ERROR"
     exit 1
 }
 
-$result = Provision-Users -CsvPath $CsvFilePath
+$result = Provision-Users -CsvPath $CsvFilePath -WhatIfMode $WhatIfMode
 
 if ($result) {
     Write-Log "Provisioning completed successfully" "INFO"
