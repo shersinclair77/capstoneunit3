@@ -1,0 +1,6 @@
+UserPrincipalName,DisplayName,GivenName,Surname,Department,UsageLocation,LicenseSku
+john.smith@company.com,John Smith,John,Smith,Engineering,US,ENTERPRISEPACK
+jane.doe@company.com,Jane Doe,Jane,Doe,Marketing,US,ENTERPRISEPACK
+michael.brown@company.com,Michael Brown,Michael,Brown,Sales,US,ENTERPRISEPACK
+sarah.jones@company.com,Sarah Jones,Sarah,Jones,Engineering,US,ENTERPRISEPACK
+david.wilson@company.com,David Wilson,David,Wilson,HR,US,ENTERPRISEPACK
