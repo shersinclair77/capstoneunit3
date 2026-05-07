@@ -41,22 +41,22 @@ $PasswordPolicies = "DisablePasswordExpiration"
 
 $Users = @(
     @{
-        FirstName  = "Alice"
-        LastName   = "Johnson"
+        FirstName  = "Zuri"
+        LastName   = "Jackson"
         Department = "Engineering"
         JobTitle   = "Software Engineer"
         # GroupIds   = @("your-group-object-id")  # Optional: assign to groups
     },
     @{
-        FirstName  = "Bob"
-        LastName   = "Smith"
+        FirstName  = "Lisa"
+        LastName   = "Smorm"
         Department = "Finance"
         JobTitle   = "Financial Analyst"
         # GroupIds   = @("your-group-object-id")
     },
     @{
-        FirstName  = "Carol"
-        LastName   = "White"
+        FirstName  = "Jenkin"
+        LastName   = "Whitter"
         Department = "HR"
         JobTitle   = "HR Manager"
         # GroupIds   = @("your-group-object-id")
