@@ -83,12 +83,12 @@ jobs:
       - name: Run provisioning script
         shell: pwsh
         env:
-          TENANT_ID:     ${{ secrets.TENANT_ID }}
+          M365_TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
           CLIENT_ID:     ${{ secrets.CLIENT_ID }}
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
         run: |
           ./scripts/Create-M365Users.ps1 `
-            -TenantId           $env:TENANT_ID `
+            -M365_TENANT_ID           $env:M365_TENANT_ID `
             -ClientId           $env:CLIENT_ID `
             -ClientSecret       $env:CLIENT_SECRET `
             -NotificationEmail  "RenaeHarewood@Renah.onmicrosoft.com" `
