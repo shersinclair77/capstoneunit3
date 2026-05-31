@@ -1,4 +1,3 @@
-
 # =============================================================================
 # Create-M365Users.ps1
 # Creates M365 users with licenses, group membership, MFA, and password policies
@@ -14,6 +13,7 @@
 #   - UserAuthenticationMethod.ReadWrite.All   (TAP creation + method removal)
 #   - Mail.Send                                (email notifications)
 #   - Application.Read.All                     (secret expiry check)
+#   - Policy.Read.All                           (Security Defaults pre-flight check)
 # =============================================================================
  
 param (
@@ -340,6 +340,84 @@ Connect-MgGraph `
 Write-Host "Connected." -ForegroundColor Green
  
 # =============================================================================
+# PRE-FLIGHT: SECURITY DEFAULTS CHECK
+# -----------------------------------------------------------------------------
+# Security Defaults and per-user MFA management are MUTUALLY EXCLUSIVE.
+# When Security Defaults is ON, all PATCH calls to strongAuthenticationRequirements
+# return HTTP 200 but are silently discarded — the state stays "disabled".
+# This is the most common reason MFA appears as disabled after provisioning.
+# =============================================================================
+ 
+Write-Host "`nRunning pre-flight checks..." -ForegroundColor Cyan
+ 
+try {
+    $SecDefaults = Invoke-MgGraphRequest `
+        -Method GET `
+        -Uri "https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy"
+ 
+    if ($SecDefaults.isEnabled -eq $true) {
+        Write-Host ""
+        Write-Host "  ╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+        Write-Host "  ║  BLOCKING ERROR: Security Defaults is ENABLED on this tenant.   ║" -ForegroundColor Red
+        Write-Host "  ║                                                                  ║" -ForegroundColor Red
+        Write-Host "  ║  Per-user MFA cannot be enforced via the API while Security     ║" -ForegroundColor Red
+        Write-Host "  ║  Defaults is active. All MFA PATCH calls return HTTP 200 but    ║" -ForegroundColor Red
+        Write-Host "  ║  the state is silently reset to 'disabled' by the platform.     ║" -ForegroundColor Red
+        Write-Host "  ║                                                                  ║" -ForegroundColor Red
+        Write-Host "  ║  TO FIX — disable Security Defaults before re-running:          ║" -ForegroundColor Red
+        Write-Host "  ║  Entra admin center > Properties >                              ║" -ForegroundColor Red
+        Write-Host "  ║  Manage security defaults > Set to Disabled > Save              ║" -ForegroundColor Red
+        Write-Host "  ║                                                                  ║" -ForegroundColor Red
+        Write-Host "  ║  NOTE: After disabling, create a Conditional Access policy      ║" -ForegroundColor Red
+        Write-Host "  ║  to require MFA for all users so tenant security is maintained. ║" -ForegroundColor Red
+        Write-Host "  ╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+        Write-Host ""
+ 
+        # Send alert email before exiting
+        $SecDefaultsAlertBody = @"
+<h2 style='color:#C0392B;font-family:Calibri,sans-serif'>⛔ Provisioning Blocked: Security Defaults Enabled</h2>
+<p style='font-family:Calibri,sans-serif'>
+The provisioning pipeline attempted to run but was blocked because
+<b>Security Defaults is enabled</b> on the <b>$Domain</b> tenant.
+</p>
+<p style='font-family:Calibri,sans-serif'>
+Security Defaults and per-user MFA management are mutually exclusive.
+While Security Defaults is active, all MFA enforcement API calls return HTTP 200
+but are silently discarded — the per-user MFA state remains <b>disabled</b>.
+</p>
+<h3 style='font-family:Calibri,sans-serif'>How to fix</h3>
+<ol style='font-family:Calibri,sans-serif'>
+  <li>Sign in to <a href='https://entra.microsoft.com'>Entra admin center</a></li>
+  <li>Go to <b>Identity &gt; Overview &gt; Properties</b></li>
+  <li>Click <b>Manage security defaults</b></li>
+  <li>Set Security defaults to <b>Disabled</b> and save</li>
+  <li>Create a <b>Conditional Access policy</b> requiring MFA for all users</li>
+  <li>Re-run the provisioning pipeline</li>
+</ol>
+<p style='font-family:Calibri,sans-serif;color:#555'>
+  <b>Run ID:</b> $RunId &nbsp; <b>Commit SHA:</b> $CommitSha &nbsp; <b>Timestamp:</b> $RunTimestamp
+</p>
+"@
+        Send-EmailNotification `
+            -Subject "BLOCKED: M365 Provisioning Failed — Security Defaults Enabled ($RunTimestamp)" `
+            -Body $SecDefaultsAlertBody
+ 
+        Disconnect-MgGraph | Out-Null
+        exit 1
+    }
+    else {
+        Write-Host "  [OK] Security Defaults is DISABLED — per-user MFA management is available." -ForegroundColor Green
+    }
+}
+catch {
+    # Policy.Read.All might not be granted — warn but continue
+    Write-Warning "  Could not check Security Defaults status: $($_.Exception.Message)"
+    Write-Warning "  Add Policy.Read.All (Application) to the App Registration to enable this check."
+    Write-Warning "  Continuing — if MFA states remain disabled after this run, Security Defaults"
+    Write-Warning "  is likely enabled. Disable it in Entra admin center and re-run."
+}
+ 
+# =============================================================================
 # SECRET EXPIRY CHECK
 # =============================================================================
  
@@ -588,3 +666,4 @@ Send-EmailNotification `
  
 Disconnect-MgGraph | Out-Null
 Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Cyan
+ 
