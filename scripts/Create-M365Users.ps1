@@ -152,6 +152,28 @@ function Set-UserMfaEnforced {
         [Parameter(Mandatory = $true)] [string]$UPN
     )
  
+    # ─────────────────────────────────────────────────────────────────────────
+    # ROOT CAUSE OF "Enabled but not Enforced":
+    #
+    # The Entra portal "Per-user MFA" page reads from:
+    #   beta/users/{id}.strongAuthenticationRequirements[].state
+    #   Valid values: Disabled | Enabled | Enforced  (PascalCase)
+    #
+    # The v1.0 authentication/requirements perUserMfaState property controls
+    # the NEW per-user MFA system and on many tenants maps to "Enabled" in the
+    # legacy portal — NOT "Enforced" — because they are separate mechanisms.
+    #
+    # Fix: beta strongAuthenticationRequirements state="Enforced" is now the
+    # PRIMARY method. v1.0 perUserMfaState is kept as a secondary supplement.
+    # A 10-second delay after account creation prevents the MFA write being
+    # overwritten by the account's own provisioning pipeline completing.
+    #
+    # Requires (Application permissions):
+    #   Policy.ReadWrite.AuthenticationMethod  — Steps 1 & 2
+    #   UserAuthenticationMethod.ReadWrite.All — Step 3 (TAP)
+    # ─────────────────────────────────────────────────────────────────────────
+ 
+    $BetaUserUri     = "https://graph.microsoft.com/beta/users/$UserId"
     $RequirementsUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/requirements"
     $TapUri          = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/temporaryAccessPassMethods"
  
@@ -159,10 +181,87 @@ function Set-UserMfaEnforced {
     $MfaMethod   = $null
     $TapCode     = $null
  
-    # ── STEP 1: Set perUserMfaState = enforced (v1.0 stable) ─────────────────
-    # This is the preferred method. Works on tenants with per-user MFA enabled.
+    # ── Propagation delay ─────────────────────────────────────────────────────
+    # New accounts need ~10 s to fully replicate across Entra ID backend nodes.
+    # Without this delay, MFA writes can be overwritten by the account's own
+    # provisioning completing after our PATCH. This is the most common cause
+    # of MFA appearing as Enabled immediately after account creation.
+    Write-Host "  [MFA] Waiting 10 s for account to propagate before enforcing MFA..." -ForegroundColor DarkGray
+    Start-Sleep -Seconds 10
+ 
+    # ── STEP 1 (PRIMARY): beta strongAuthenticationRequirements state=Enforced ─
+    # This is the ONLY property the Entra portal "Per-user MFA" page reads.
+    # state="Enforced" means the user cannot skip MFA registration on first login.
+    # state="Enabled"  means the user CAN skip — this is what showed previously.
     # Requires: Policy.ReadWrite.AuthenticationMethod (Application)
-    Write-Host "  [MFA Step 1] Setting perUserMfaState via v1.0 requirements endpoint..." -ForegroundColor Cyan
+    Write-Host "  [MFA Step 1] Setting strongAuthenticationRequirements = Enforced (beta)..." -ForegroundColor Cyan
+    try {
+        $BetaBody = @{
+            strongAuthenticationRequirements = @(
+                @{
+                    state                          = "Enforced"
+                    rememberDevicesNotIssuedBefore = (Get-Date).ToUniversalTime().ToString("o")
+                }
+            )
+        }
+        Invoke-MgGraphRequest `
+            -Method PATCH `
+            -Uri $BetaUserUri `
+            -ContentType "application/json" `
+            -Body ($BetaBody | ConvertTo-Json -Depth 5)
+ 
+        # Verify: GET and confirm state is exactly "Enforced" (not "Enabled")
+        Start-Sleep -Seconds 3
+        $BetaGet   = Invoke-MgGraphRequest -Method GET `
+                         -Uri "$BetaUserUri`?`$select=strongAuthenticationRequirements"
+        $BetaState = ($BetaGet.strongAuthenticationRequirements |
+                      Select-Object -First 1).state
+ 
+        if ($BetaState -eq "Enforced") {
+            Write-Host "  [OK] strongAuthenticationRequirements.state verified = Enforced." -ForegroundColor Green
+            $MfaEnforced = $true
+            $MfaMethod   = "beta-strongAuth-Enforced"
+        }
+        elseif ($BetaState -eq "Enabled") {
+            # PATCH accepted but wrote Enabled instead of Enforced.
+            # Retry once with an explicit array replace.
+            Write-Warning "  State came back as Enabled — retrying with explicit Enforced..."
+            Start-Sleep -Seconds 5
+            Invoke-MgGraphRequest `
+                -Method PATCH `
+                -Uri $BetaUserUri `
+                -ContentType "application/json" `
+                -Body ($BetaBody | ConvertTo-Json -Depth 5)
+            Start-Sleep -Seconds 3
+            $Retry = Invoke-MgGraphRequest -Method GET `
+                         -Uri "$BetaUserUri`?`$select=strongAuthenticationRequirements"
+            $RetryState = ($Retry.strongAuthenticationRequirements | Select-Object -First 1).state
+            if ($RetryState -eq "Enforced") {
+                Write-Host "  [OK] Retry succeeded — state verified = Enforced." -ForegroundColor Green
+                $MfaEnforced = $true
+                $MfaMethod   = "beta-strongAuth-Enforced-retry"
+            }
+            else {
+                Write-Warning "  Retry state = $RetryState. Tenant may enforce via Conditional Access."
+                Write-Warning "  ACTION: Verify MFA state for $UPN in Entra admin center."
+                # Still mark as attempted so TAP is issued
+            }
+        }
+        else {
+            Write-Warning "  Unexpected state returned: $BetaState"
+            Write-Warning "  ACTION: Manually check MFA state for $UPN in Entra admin center."
+        }
+    }
+    catch {
+        Write-Warning "  Step 1 failed: $($_.Exception.Message)"
+    }
+ 
+    # ── STEP 2 (SUPPLEMENT): v1.0 perUserMfaState = enforced ─────────────────
+    # Sets the new per-user MFA flag in addition to Step 1.
+    # This ensures enforcement via both the legacy and new MFA systems.
+    # Does NOT replace Step 1 — the portal still reads strongAuthenticationRequirements.
+    # Requires: Policy.ReadWrite.AuthenticationMethod (Application)
+    Write-Host "  [MFA Step 2] Setting perUserMfaState = enforced (v1.0 supplement)..." -ForegroundColor Cyan
     try {
         Invoke-MgGraphRequest `
             -Method PATCH `
@@ -170,75 +269,26 @@ function Set-UserMfaEnforced {
             -ContentType "application/json" `
             -Body (@{ perUserMfaState = "enforced" } | ConvertTo-Json -Depth 3)
  
-        # Verify the change was actually applied — do not trust the HTTP 200 alone
-        $Verify = Invoke-MgGraphRequest -Method GET -Uri $RequirementsUri
-        if ($Verify.perUserMfaState -eq "enforced") {
-            Write-Host "  [OK] perUserMfaState verified as 'enforced' (v1.0)." -ForegroundColor Green
-            $MfaEnforced = $true
-            $MfaMethod   = "v1.0-requirements"
+        $V1Get   = Invoke-MgGraphRequest -Method GET -Uri $RequirementsUri
+        $V1State = $V1Get.perUserMfaState
+        if ($V1State -eq "enforced") {
+            Write-Host "  [OK] perUserMfaState verified = enforced (v1.0)." -ForegroundColor Green
+            if (-not $MfaEnforced) {
+                $MfaEnforced = $true
+                $MfaMethod   = "v1.0-requirements-only"
+            }
         }
         else {
-            Write-Warning "  PATCH returned 200 but GET shows perUserMfaState = '$($Verify.perUserMfaState)'. Trying fallback."
+            Write-Warning "  v1.0 perUserMfaState = $V1State (expected enforced)."
         }
     }
     catch {
-        Write-Warning "  Step 1 failed: $($_.Exception.Message)"
+        Write-Warning "  Step 2 (v1.0 supplement) failed: $($_.Exception.Message)"
     }
  
-    # ── STEP 2: Beta endpoint fallback ────────────────────────────────────────
-    # Used when the tenant hasn't enabled per-user MFA via the v1.0 API, or
-    # when Step 1 returned 404/403. The beta strongAuthenticationRequirements
-    # property still works on many Business Premium tenants.
-    # Requires: Policy.ReadWrite.AuthenticationMethod (Application)
-    if (-not $MfaEnforced) {
-        Write-Host "  [MFA Step 2] Trying beta strongAuthenticationRequirements fallback..." -ForegroundColor Cyan
-        try {
-            $BetaBody = @{
-                strongAuthenticationRequirements = @(
-                    @{
-                        state                          = "Enforced"
-                        rememberDevicesNotIssuedBefore = (Get-Date).ToUniversalTime().ToString("o")
-                    }
-                )
-            }
-            Invoke-MgGraphRequest `
-                -Method PATCH `
-                -Uri "https://graph.microsoft.com/beta/users/$UserId" `
-                -ContentType "application/json" `
-                -Body ($BetaBody | ConvertTo-Json -Depth 5)
- 
-            # Verify via beta GET
-            $BetaVerify = Invoke-MgGraphRequest `
-                -Method GET `
-                -Uri "https://graph.microsoft.com/beta/users/$UserId`?`$select=strongAuthenticationRequirements"
- 
-            $BetaState = $BetaVerify.strongAuthenticationRequirements | Select-Object -ExpandProperty state -ErrorAction SilentlyContinue
-            if ($BetaState -eq "Enforced") {
-                Write-Host "  [OK] strongAuthenticationRequirements verified as 'Enforced' (beta)." -ForegroundColor Green
-                $MfaEnforced = $true
-                $MfaMethod   = "beta-strongAuth"
-            }
-            else {
-                Write-Warning "  Beta PATCH returned 200 but state = '$BetaState'. MFA may not be enforced."
-                # Accept it anyway — some tenants don't return the property on read
-                # but the enforcement is active. Flag it for manual verification.
-                $MfaEnforced = $true
-                $MfaMethod   = "beta-strongAuth-unverified"
-                Write-Warning "  ACTION: Manually verify MFA state for $UPN in Entra admin center."
-            }
-        }
-        catch {
-            Write-Warning "  Step 2 also failed: $($_.Exception.Message)"
-            Write-Warning "  ACTION: MFA must be enforced manually for $UPN in Entra admin center."
-            Write-Warning "  HINT: If your tenant uses Conditional Access exclusively, per-user MFA"
-            Write-Warning "        APIs may be disabled. Verify the CA policy covers this user."
-        }
-    }
- 
-    # ── STEP 3: Issue Temporary Access Pass ───────────────────────────────────
-    # Independent of Steps 1/2. Gives the user a secure one-time credential
-    # for their first login. They must register an MFA method before the TAP
-    # expires (60 minutes). This replaces communicating a temp password insecurely.
+    # ── STEP 3: Temporary Access Pass ────────────────────────────────────────
+    # Independent of Steps 1 & 2. One-use, 60-minute credential for first login.
+    # User must register an MFA method (Authenticator app) before TAP expires.
     # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
     Write-Host "  [MFA Step 3] Issuing Temporary Access Pass (60 min, one-use)..." -ForegroundColor Cyan
     try {
@@ -249,15 +299,13 @@ function Set-UserMfaEnforced {
             -Body (@{ isUsableOnce = $true; lifetimeInMinutes = 60 } | ConvertTo-Json -Depth 3)
  
         $TapCode = $TapResponse.temporaryAccessPass
-        Write-Host "  [OK] TAP issued for $UPN." -ForegroundColor Green
-        Write-Host "       TAP code (share securely with user): $TapCode" -ForegroundColor Magenta
-        Write-Host "       User must sign in and register an authenticator app within 60 minutes." -ForegroundColor Magenta
+        Write-Host "  [OK] TAP issued for $UPN (expires 60 min)." -ForegroundColor Green
+        Write-Host "       TAP (share securely): $TapCode" -ForegroundColor Magenta
+        Write-Host "       User must register an authenticator app within 60 minutes." -ForegroundColor Magenta
     }
     catch {
         Write-Warning "  TAP creation failed: $($_.Exception.Message)"
-        Write-Warning "  The user's temporary password will still work for first login."
-        Write-Warning "  HINT: Ensure UserAuthenticationMethod.ReadWrite.All (Application) is"
-        Write-Warning "        granted on the App Registration with admin consent."
+        Write-Warning "  Ensure UserAuthenticationMethod.ReadWrite.All (Application) is granted."
     }
  
     # ── Return status ─────────────────────────────────────────────────────────
@@ -271,7 +319,7 @@ function Set-UserMfaEnforced {
         return "TAP issued — MFA enforcement FAILED (manual action required)"
     }
     else {
-        return "FAILED — MFA not enforced, TAP not issued (check permissions)"
+        return "FAILED — MFA not enforced and TAP not issued (check permissions)"
     }
 }
  
