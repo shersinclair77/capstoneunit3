@@ -16,16 +16,16 @@
 
 param (
     [Parameter(Mandatory = $true)]
-    [string]$TenantId,
+    [string]$M365_TENANT_ID,
 
     [Parameter(Mandatory = $true)]
-    [string]$ClientId,
+    [string]$M365_CLIENT_ID,
 
     [Parameter(Mandatory = $true)]
-    [string]$ClientSecret,
+    [string]$M365_CLIENT_SECRET,
 
     [Parameter(Mandatory = $true)]
-    [string]$NotificationEmail,
+    [string]$Notification_Email,
 
     # Injected by GitHub Actions workflow for run metadata
     [Parameter(Mandatory = $false)]
