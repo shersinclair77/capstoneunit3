@@ -1,3 +1,4 @@
+
 # =============================================================================
 # Create-M365Users.ps1
 # Creates M365 users with licenses, group membership, MFA, and password policies
@@ -153,174 +154,102 @@ function Set-UserMfaEnforced {
     )
  
     # ─────────────────────────────────────────────────────────────────────────
-    # ROOT CAUSE OF "Enabled but not Enforced":
+    # Diagnostic findings:
+    #   - beta/users/{id} strongAuthenticationRequirements → 400 BadRequest
+    #     (deprecated on modern tenants — dropped entirely)
+    #   - v1.0/users/{id}/authentication/requirements perUserMfaState → 400
+    #     (requires UserAuthenticationMethod.ReadWrite.All, not just
+    #      Policy.ReadWrite.AuthenticationMethod)
+    #   - v1.0 TAP creation → 403 Forbidden
+    #     (same missing permission: UserAuthenticationMethod.ReadWrite.All)
     #
-    # The Entra portal "Per-user MFA" page reads from:
-    #   beta/users/{id}.strongAuthenticationRequirements[].state
-    #   Valid values: Disabled | Enabled | Enforced  (PascalCase)
+    # Fix applied: drop deprecated beta approach. Use only:
+    #   PATCH /v1.0/users/{id}/authentication/requirements perUserMfaState=enforced
+    #   POST  /v1.0/users/{id}/authentication/temporaryAccessPassMethods
     #
-    # The v1.0 authentication/requirements perUserMfaState property controls
-    # the NEW per-user MFA system and on many tenants maps to "Enabled" in the
-    # legacy portal — NOT "Enforced" — because they are separate mechanisms.
-    #
-    # Fix: beta strongAuthenticationRequirements state="Enforced" is now the
-    # PRIMARY method. v1.0 perUserMfaState is kept as a secondary supplement.
-    # A 10-second delay after account creation prevents the MFA write being
-    # overwritten by the account's own provisioning pipeline completing.
-    #
-    # Requires (Application permissions):
-    #   Policy.ReadWrite.AuthenticationMethod  — Steps 1 & 2
-    #   UserAuthenticationMethod.ReadWrite.All — Step 3 (TAP)
+    # Required permission (Application):
+    #   UserAuthenticationMethod.ReadWrite.All
+    #   (NOT UserAuthenticationMethod.Read.All — that is read-only)
     # ─────────────────────────────────────────────────────────────────────────
  
-    $BetaUserUri     = "https://graph.microsoft.com/beta/users/$UserId"
-    $RequirementsUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/requirements"
-    $TapUri          = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/temporaryAccessPassMethods"
+    $ReqUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/requirements"
+    $TapUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/temporaryAccessPassMethods"
  
     $MfaEnforced = $false
-    $MfaMethod   = $null
     $TapCode     = $null
  
-    # ── Propagation delay ─────────────────────────────────────────────────────
-    # New accounts need ~10 s to fully replicate across Entra ID backend nodes.
-    # Without this delay, MFA writes can be overwritten by the account's own
-    # provisioning completing after our PATCH. This is the most common cause
-    # of MFA appearing as Enabled immediately after account creation.
-    Write-Host "  [MFA] Waiting 10 s for account to propagate before enforcing MFA..." -ForegroundColor DarkGray
+    # Propagation delay — new accounts need time to replicate before
+    # authentication method writes are accepted.
+    Write-Host "  [MFA] Waiting 10 s for account propagation..." -ForegroundColor DarkGray
     Start-Sleep -Seconds 10
  
-    # ── STEP 1 (PRIMARY): beta strongAuthenticationRequirements state=Enforced ─
-    # This is the ONLY property the Entra portal "Per-user MFA" page reads.
-    # state="Enforced" means the user cannot skip MFA registration on first login.
-    # state="Enabled"  means the user CAN skip — this is what showed previously.
-    # Requires: Policy.ReadWrite.AuthenticationMethod (Application)
-    Write-Host "  [MFA Step 1] Setting strongAuthenticationRequirements = Enforced (beta)..." -ForegroundColor Cyan
-    try {
-        $BetaBody = @{
-            strongAuthenticationRequirements = @(
-                @{
-                    state                          = "Enforced"
-                    rememberDevicesNotIssuedBefore = (Get-Date).ToUniversalTime().ToString("o")
-                }
-            )
-        }
-        Invoke-MgGraphRequest `
-            -Method PATCH `
-            -Uri $BetaUserUri `
-            -ContentType "application/json" `
-            -Body ($BetaBody | ConvertTo-Json -Depth 5)
- 
-        # Verify: GET and confirm state is exactly "Enforced" (not "Enabled")
-        Start-Sleep -Seconds 3
-        $BetaGet   = Invoke-MgGraphRequest -Method GET `
-                         -Uri "$BetaUserUri`?`$select=strongAuthenticationRequirements"
-        $BetaState = ($BetaGet.strongAuthenticationRequirements |
-                      Select-Object -First 1).state
- 
-        if ($BetaState -eq "Enforced") {
-            Write-Host "  [OK] strongAuthenticationRequirements.state verified = Enforced." -ForegroundColor Green
-            $MfaEnforced = $true
-            $MfaMethod   = "beta-strongAuth-Enforced"
-        }
-        elseif ($BetaState -eq "Enabled") {
-            # PATCH accepted but wrote Enabled instead of Enforced.
-            # Retry once with an explicit array replace.
-            Write-Warning "  State came back as Enabled — retrying with explicit Enforced..."
-            Start-Sleep -Seconds 5
-            Invoke-MgGraphRequest `
-                -Method PATCH `
-                -Uri $BetaUserUri `
-                -ContentType "application/json" `
-                -Body ($BetaBody | ConvertTo-Json -Depth 5)
-            Start-Sleep -Seconds 3
-            $Retry = Invoke-MgGraphRequest -Method GET `
-                         -Uri "$BetaUserUri`?`$select=strongAuthenticationRequirements"
-            $RetryState = ($Retry.strongAuthenticationRequirements | Select-Object -First 1).state
-            if ($RetryState -eq "Enforced") {
-                Write-Host "  [OK] Retry succeeded — state verified = Enforced." -ForegroundColor Green
-                $MfaEnforced = $true
-                $MfaMethod   = "beta-strongAuth-Enforced-retry"
-            }
-            else {
-                Write-Warning "  Retry state = $RetryState. Tenant may enforce via Conditional Access."
-                Write-Warning "  ACTION: Verify MFA state for $UPN in Entra admin center."
-                # Still mark as attempted so TAP is issued
-            }
-        }
-        else {
-            Write-Warning "  Unexpected state returned: $BetaState"
-            Write-Warning "  ACTION: Manually check MFA state for $UPN in Entra admin center."
-        }
-    }
-    catch {
-        Write-Warning "  Step 1 failed: $($_.Exception.Message)"
-    }
- 
-    # ── STEP 2 (SUPPLEMENT): v1.0 perUserMfaState = enforced ─────────────────
-    # Sets the new per-user MFA flag in addition to Step 1.
-    # This ensures enforcement via both the legacy and new MFA systems.
-    # Does NOT replace Step 1 — the portal still reads strongAuthenticationRequirements.
-    # Requires: Policy.ReadWrite.AuthenticationMethod (Application)
-    Write-Host "  [MFA Step 2] Setting perUserMfaState = enforced (v1.0 supplement)..." -ForegroundColor Cyan
+    # ── Step 1: Set perUserMfaState = enforced ────────────────────────────────
+    # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
+    # Note: Policy.ReadWrite.AuthenticationMethod controls TENANT-LEVEL method
+    # policies only — it does NOT grant write access to per-user MFA state.
+    Write-Host "  [MFA 1/2] Setting perUserMfaState = enforced..." -ForegroundColor Cyan
     try {
         Invoke-MgGraphRequest `
             -Method PATCH `
-            -Uri $RequirementsUri `
+            -Uri $ReqUri `
             -ContentType "application/json" `
             -Body (@{ perUserMfaState = "enforced" } | ConvertTo-Json -Depth 3)
  
-        $V1Get   = Invoke-MgGraphRequest -Method GET -Uri $RequirementsUri
-        $V1State = $V1Get.perUserMfaState
-        if ($V1State -eq "enforced") {
-            Write-Host "  [OK] perUserMfaState verified = enforced (v1.0)." -ForegroundColor Green
-            if (-not $MfaEnforced) {
-                $MfaEnforced = $true
-                $MfaMethod   = "v1.0-requirements-only"
-            }
+        # Verify — read back and confirm value
+        Start-Sleep -Seconds 3
+        $verify = Invoke-MgGraphRequest -Method GET -Uri $ReqUri
+        if ($verify.perUserMfaState -eq "enforced") {
+            Write-Host "  [OK] perUserMfaState verified = enforced." -ForegroundColor Green
+            $MfaEnforced = $true
         }
         else {
-            Write-Warning "  v1.0 perUserMfaState = $V1State (expected enforced)."
+            Write-Warning "  PATCH returned 200 but perUserMfaState = '$($verify.perUserMfaState)'."
+            Write-Warning "  ACTION: Check App Registration has UserAuthenticationMethod.ReadWrite.All"
+            Write-Warning "          (not Read.All) with admin consent granted."
         }
     }
     catch {
-        Write-Warning "  Step 2 (v1.0 supplement) failed: $($_.Exception.Message)"
+        $msg = $_.Exception.Message
+        Write-Warning "  MFA PATCH failed: $msg"
+        if ($msg -like "*BadRequest*") {
+            Write-Warning "  BadRequest usually means UserAuthenticationMethod.ReadWrite.All is"
+            Write-Warning "  missing or admin consent has not been granted. Verify in Entra:"
+            Write-Warning "  App registrations > your app > API permissions > grant admin consent."
+        }
+        elseif ($msg -like "*Forbidden*") {
+            Write-Warning "  Forbidden means the permission is absent entirely. Add"
+            Write-Warning "  UserAuthenticationMethod.ReadWrite.All (Application) to the App Registration."
+        }
     }
  
-    # ── STEP 3: Temporary Access Pass ────────────────────────────────────────
-    # Independent of Steps 1 & 2. One-use, 60-minute credential for first login.
-    # User must register an MFA method (Authenticator app) before TAP expires.
+    # ── Step 2: Issue Temporary Access Pass ───────────────────────────────────
+    # One-use, 60-minute credential for first login.
+    # User must register an MFA method before the TAP expires.
     # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
-    Write-Host "  [MFA Step 3] Issuing Temporary Access Pass (60 min, one-use)..." -ForegroundColor Cyan
+    Write-Host "  [MFA 2/2] Issuing Temporary Access Pass (60 min, one-use)..." -ForegroundColor Cyan
     try {
-        $TapResponse = Invoke-MgGraphRequest `
-            -Method POST `
-            -Uri $TapUri `
-            -ContentType "application/json" `
-            -Body (@{ isUsableOnce = $true; lifetimeInMinutes = 60 } | ConvertTo-Json -Depth 3)
- 
-        $TapCode = $TapResponse.temporaryAccessPass
+        $tap     = Invoke-MgGraphRequest `
+                       -Method POST `
+                       -Uri $TapUri `
+                       -ContentType "application/json" `
+                       -Body (@{ isUsableOnce = $true; lifetimeInMinutes = 60 } | ConvertTo-Json -Depth 3)
+        $TapCode = $tap.temporaryAccessPass
         Write-Host "  [OK] TAP issued for $UPN (expires 60 min)." -ForegroundColor Green
-        Write-Host "       TAP (share securely): $TapCode" -ForegroundColor Magenta
-        Write-Host "       User must register an authenticator app within 60 minutes." -ForegroundColor Magenta
+        Write-Host "       TAP (share securely with user): $TapCode" -ForegroundColor Magenta
+        Write-Host "       User must sign in with this TAP and register an" -ForegroundColor Magenta
+        Write-Host "       authenticator app before it expires." -ForegroundColor Magenta
     }
     catch {
         Write-Warning "  TAP creation failed: $($_.Exception.Message)"
-        Write-Warning "  Ensure UserAuthenticationMethod.ReadWrite.All (Application) is granted."
+        Write-Warning "  Ensure UserAuthenticationMethod.ReadWrite.All (Application)"
+        Write-Warning "  is granted with admin consent on the App Registration."
     }
  
     # ── Return status ─────────────────────────────────────────────────────────
-    if ($MfaEnforced -and $TapCode) {
-        return "Enforced+TAP ($MfaMethod)"
-    }
-    elseif ($MfaEnforced) {
-        return "Enforced ($MfaMethod) — TAP failed"
-    }
-    elseif ($TapCode) {
-        return "TAP issued — MFA enforcement FAILED (manual action required)"
-    }
-    else {
-        return "FAILED — MFA not enforced and TAP not issued (check permissions)"
-    }
+    if ($MfaEnforced -and $TapCode)  { return "Enforced+TAP" }
+    elseif ($MfaEnforced)            { return "Enforced (no TAP — check permission)" }
+    elseif ($TapCode)                { return "TAP only — MFA state FAILED (check permission)" }
+    else                             { return "FAILED — add UserAuthenticationMethod.ReadWrite.All" }
 }
  
 # =============================================================================
@@ -666,4 +595,3 @@ Send-EmailNotification `
  
 Disconnect-MgGraph | Out-Null
 Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Cyan
- 
