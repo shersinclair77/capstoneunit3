@@ -84,14 +84,14 @@ jobs:
         shell: pwsh
         env:
           M365_TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
-          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          M365_CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
+          M365_CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRETT }}
         run: |
           ./scripts/Create-M365Users.ps1 `
             -M365_TENANT_ID           $env:M365_TENANT_ID `
-            -ClientId           $env:CLIENT_ID `
-            -ClientSecret       $env:CLIENT_SECRET `
-            -NotificationEmail  "RenaeHarewood@Renah.onmicrosoft.com" `
+            -M365_CLIENT_ID           $env:M365_CLIENT_ID `
+            -M365_CLIENT_SECRET      $env:M365_CLIENT_SECRET `
+            -Notification_Email  "RenaeHarewood@Renah.onmicrosoft.com" `
             -RunId              "${{ github.run_id }}" `
             -CommitSha          "${{ github.sha }}" `
             -CsvPath            "${{ github.event.inputs.csv_path || './onboarding/users-to-onboard.csv' }}"
