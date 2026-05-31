@@ -1,4 +1,4 @@
 FirstName,LastName,Department,JobTitle,GroupIds
-Alice,Johnson,Engineering,Software Engineer,
-Bob,Smith,Finance,Financial Analyst,
-Carol,White,HR,HR Manager,
+Alice,Johnson,Engineering,Software Engineer,I.T. Group,
+Bob,Smith,Finance,Financial Analyst,Finance Group,
+Carol,White,HR,HR Manager,HR Group,
