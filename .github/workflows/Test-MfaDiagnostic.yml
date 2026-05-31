@@ -11,9 +11,9 @@
 # REQUIRED SECRETS (same as provisioning workflow):
 #   TENANT_ID, CLIENT_ID, CLIENT_SECRET
 # =============================================================================
-
+ 
 name: MFA Diagnostic
-
+ 
 on:
   workflow_dispatch:
     inputs:
@@ -21,19 +21,58 @@ on:
         description: 'UPN of an existing user to test MFA against'
         required: true
         default: 'alice.johnson@renah.onmicrosoft.com'
-
+ 
 jobs:
   diagnose:
     name: Run MFA Diagnostic
     runs-on: ubuntu-latest
-
+ 
     steps:
       - name: Install Microsoft.Graph module
         shell: pwsh
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Microsoft.Graph -Scope CurrentUser -Force
-
+ 
+      # ── Pre-check: verify secrets are populated ──────────────────────────────
+      - name: Verify secrets are set
+        shell: pwsh
+        env:
+          TENANT_ID:     ${{ secrets.TENANT_ID }}
+          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+        run: |
+          $missing = @()
+          if ([string]::IsNullOrWhiteSpace($env:TENANT_ID))     { $missing += "TENANT_ID" }
+          if ([string]::IsNullOrWhiteSpace($env:CLIENT_ID))     { $missing += "CLIENT_ID" }
+          if ([string]::IsNullOrWhiteSpace($env:CLIENT_SECRET)) { $missing += "CLIENT_SECRET" }
+ 
+          if ($missing.Count -gt 0) {
+            Write-Host ""
+            Write-Host "  ╔════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+            Write-Host "  ║  MISSING GITHUB SECRETS — cannot connect to Graph         ║" -ForegroundColor Red
+            Write-Host "  ║                                                            ║" -ForegroundColor Red
+            foreach ($s in $missing) {
+              Write-Host "  ║  Missing: $($s.PadRight(50)) ║" -ForegroundColor Red
+            }
+            Write-Host "  ║                                                            ║" -ForegroundColor Red
+            Write-Host "  ║  Fix: GitHub repo > Settings > Secrets and variables >    ║" -ForegroundColor Red
+            Write-Host "  ║       Actions > New repository secret                     ║" -ForegroundColor Red
+            Write-Host "  ║                                                            ║" -ForegroundColor Red
+            Write-Host "  ║  Required secret names (case-sensitive):                  ║" -ForegroundColor Red
+            Write-Host "  ║    TENANT_ID      — Azure AD tenant ID (GUID)             ║" -ForegroundColor Red
+            Write-Host "  ║    CLIENT_ID      — App Registration client ID (GUID)     ║" -ForegroundColor Red
+            Write-Host "  ║    CLIENT_SECRET  — App Registration client secret value  ║" -ForegroundColor Red
+            Write-Host "  ╚════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+            exit 1
+          }
+ 
+          # Show length only (never reveal the actual value)
+          Write-Host "  [PASS] TENANT_ID     is set ($($env:TENANT_ID.Length) chars)" -ForegroundColor Green
+          Write-Host "  [PASS] CLIENT_ID     is set ($($env:CLIENT_ID.Length) chars)" -ForegroundColor Green
+          Write-Host "  [PASS] CLIENT_SECRET is set ($($env:CLIENT_SECRET.Length) chars)" -ForegroundColor Green
+          Write-Host "  [INFO] Test UPN : ${{ github.event.inputs.test_user_upn }}" -ForegroundColor Cyan
+ 
       - name: Run MFA diagnostic
         shell: pwsh
         env:
@@ -42,7 +81,7 @@ jobs:
           CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
           TEST_UPN:      ${{ github.event.inputs.test_user_upn }}
         run: |
-
+ 
           function Write-Step { param([string]$n,[string]$m)
             Write-Host ""
             Write-Host ("="*70) -ForegroundColor DarkGray
@@ -53,9 +92,23 @@ jobs:
           function Write-FAIL { param([string]$m) Write-Host "  [FAIL] $m" -ForegroundColor Red    }
           function Write-INFO { param([string]$m) Write-Host "  [INFO] $m" -ForegroundColor Cyan   }
           function Write-WARN { param([string]$m) Write-Host "  [WARN] $m" -ForegroundColor Yellow }
-
+ 
           # ── Connect ──────────────────────────────────────────────────────────
           Write-Step "0" "Connect to Microsoft Graph"
+ 
+          # Validate each secret individually for a clear error message
+          $secrets = @{
+            TENANT_ID     = $env:TENANT_ID
+            CLIENT_ID     = $env:CLIENT_ID
+            CLIENT_SECRET = $env:CLIENT_SECRET
+          }
+          foreach ($kv in $secrets.GetEnumerator()) {
+            if ([string]::IsNullOrWhiteSpace($kv.Value)) {
+              Write-FAIL "$($kv.Key) secret is empty — add it in repo Settings > Secrets and variables > Actions"
+              exit 1
+            }
+          }
+ 
           try {
             $sec  = ConvertTo-SecureString $env:CLIENT_SECRET -AsPlainText -Force
             $cred = New-Object System.Management.Automation.PSCredential($env:CLIENT_ID, $sec)
@@ -63,9 +116,15 @@ jobs:
             Write-OK "Connected successfully."
           } catch {
             Write-FAIL "Connection failed: $_"
+            Write-FAIL ""
+            Write-FAIL "Common causes:"
+            Write-FAIL "  - TENANT_ID is wrong (should be the directory/tenant GUID, not a domain name)"
+            Write-FAIL "  - CLIENT_ID is wrong (should be the application/client GUID)"
+            Write-FAIL "  - CLIENT_SECRET has expired — create a new one in Entra > App registrations"
+            Write-FAIL "  - CLIENT_SECRET value was copied with a leading/trailing space"
             exit 1
           }
-
+ 
           # ── Step 1: Security Defaults ─────────────────────────────────────────
           Write-Step "1" "Security Defaults — must be DISABLED for per-user MFA to work"
           try {
@@ -83,7 +142,7 @@ jobs:
             Write-WARN "Could not read Security Defaults: $($_.Exception.Message)"
             Write-WARN "Add Policy.Read.All (Application) permission and re-run."
           }
-
+ 
           # ── Step 2: Token permissions ─────────────────────────────────────────
           Write-Step "2" "Token permissions — which permissions did the App Registration actually receive?"
           try {
@@ -92,7 +151,7 @@ jobs:
             Write-INFO "TenantId : $($ctx.TenantId)"
             Write-INFO "Scopes granted:"
             $ctx.Scopes | Sort-Object | ForEach-Object { Write-INFO "  $_" }
-
+ 
             $required = @(
               "Policy.ReadWrite.AuthenticationMethod",
               "UserAuthenticationMethod.ReadWrite.All",
@@ -111,7 +170,7 @@ jobs:
           } catch {
             Write-WARN "Could not read token context: $_"
           }
-
+ 
           # ── Step 3: Resolve user ───────────────────────────────────────────────
           Write-Step "3" "Resolve user: $env:TEST_UPN"
           $User = $null
@@ -129,12 +188,12 @@ jobs:
             Disconnect-MgGraph | Out-Null
             exit 1
           }
-
+ 
           $UserId  = $User.Id
           $BetaUri = "https://graph.microsoft.com/beta/users/$UserId"
           $ReqUri  = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/requirements"
           $TapUri  = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/temporaryAccessPassMethods"
-
+ 
           # ── Step 4: Read current MFA state ─────────────────────────────────────
           Write-Step "4" "Read CURRENT MFA state before any changes"
           try {
@@ -153,7 +212,7 @@ jobs:
           } catch {
             Write-WARN "Could not read v1.0 requirements: $($_.Exception.Message)"
           }
-
+ 
           # ── Step 5: Attempt PATCH ──────────────────────────────────────────────
           Write-Step "5" "PATCH strongAuthenticationRequirements = Enforced"
           $patchBody = @{
@@ -167,7 +226,7 @@ jobs:
           $patchJson = $patchBody | ConvertTo-Json -Depth 5
           Write-INFO "Request body being sent:"
           Write-INFO $patchJson
-
+ 
           try {
             Invoke-MgGraphRequest `
               -Method PATCH `
@@ -184,7 +243,7 @@ jobs:
               Write-FAIL "  Error msg : $($errBody.error.message)"
             } catch { }
           }
-
+ 
           # ── Step 6: Read back after PATCH ─────────────────────────────────────
           Write-Step "6" "Read MFA state AFTER PATCH (5 s delay)"
           Start-Sleep -Seconds 5
@@ -194,7 +253,7 @@ jobs:
             $afterState = ($after.strongAuthenticationRequirements | Select-Object -First 1).state
             Write-INFO "Raw strongAuthenticationRequirements after PATCH: $($after.strongAuthenticationRequirements | ConvertTo-Json -Compress)"
             Write-INFO "State after PATCH: '$afterState'"
-
+ 
             if ($afterState -eq "Enforced") {
               Write-OK "SUCCESS — state is Enforced. MFA enforcement is working."
             } elseif ($afterState -eq "Enabled") {
@@ -213,7 +272,7 @@ jobs:
           } catch {
             Write-FAIL "Could not read state after PATCH: $($_.Exception.Message)"
           }
-
+ 
           # ── Step 7: v1.0 PATCH ────────────────────────────────────────────────
           Write-Step "7" "PATCH v1.0 perUserMfaState = enforced"
           try {
@@ -238,7 +297,7 @@ jobs:
               Write-FAIL "  Msg : $($errBody.error.message)"
             } catch { }
           }
-
+ 
           # ── Step 8: TAP test ──────────────────────────────────────────────────
           Write-Step "8" "Test Temporary Access Pass creation"
           try {
@@ -258,12 +317,12 @@ jobs:
               Write-FAIL "  Msg : $($errBody.error.message)"
             } catch { }
           }
-
+ 
           # ── Summary ───────────────────────────────────────────────────────────
           Write-Host ""
           Write-Host ("="*70) -ForegroundColor DarkGray
           Write-Host "  DIAGNOSTIC COMPLETE" -ForegroundColor White
           Write-Host "  Review the [PASS] / [FAIL] lines above to identify the issue." -ForegroundColor White
           Write-Host ("="*70) -ForegroundColor DarkGray
-
+ 
           Disconnect-MgGraph | Out-Null
