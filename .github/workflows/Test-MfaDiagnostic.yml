@@ -38,9 +38,9 @@ jobs:
       - name: Verify secrets are set
         shell: pwsh
         env:
-          TENANT_ID:     ${{ secrets.TENANT_ID }}
-          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
+          CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRET }}
         run: |
           $missing = @()
           if ([string]::IsNullOrWhiteSpace($env:TENANT_ID))     { $missing += "TENANT_ID" }
@@ -60,9 +60,9 @@ jobs:
             Write-Host "  ║       Actions > New repository secret                     ║" -ForegroundColor Red
             Write-Host "  ║                                                            ║" -ForegroundColor Red
             Write-Host "  ║  Required secret names (case-sensitive):                  ║" -ForegroundColor Red
-            Write-Host "  ║    TENANT_ID      — Azure AD tenant ID (GUID)             ║" -ForegroundColor Red
-            Write-Host "  ║    CLIENT_ID      — App Registration client ID (GUID)     ║" -ForegroundColor Red
-            Write-Host "  ║    CLIENT_SECRET  — App Registration client secret value  ║" -ForegroundColor Red
+            Write-Host "  ║    M365_TENANT_ID      — Azure AD tenant ID (GUID)             ║" -ForegroundColor Red
+            Write-Host "  ║    M365_CLIENT_ID      — App Registration client ID (GUID)     ║" -ForegroundColor Red
+            Write-Host "  ║    M365_CLIENT_SECRET  — App Registration client secret value  ║" -ForegroundColor Red
             Write-Host "  ╚════════════════════════════════════════════════════════════╝" -ForegroundColor Red
             exit 1
           }
@@ -76,9 +76,9 @@ jobs:
       - name: Run MFA diagnostic
         shell: pwsh
         env:
-          TENANT_ID:     ${{ secrets.TENANT_ID }}
-          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
+          CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
+          CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRET }}
           TEST_UPN:      ${{ github.event.inputs.test_user_upn }}
         run: |
  
