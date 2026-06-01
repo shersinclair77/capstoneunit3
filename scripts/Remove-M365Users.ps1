@@ -269,8 +269,12 @@ foreach ($Row in $CsvData) {
 
     # --- Block sign-in ---
     try {
-        Update-MgUser -UserId $User.Id -AccountEnabled $false
-        Write-Host "  [OK] Sign-in blocked (AccountEnabled = false)." -ForegroundColor Green
+        Invoke-MgGraphRequest `
+            -Method PATCH `
+            -Uri "https://graph.microsoft.com/v1.0/users/$($User.Id)" `
+            -ContentType "application/json" `
+            -Body (@{ accountEnabled = $false } | ConvertTo-Json -Depth 3)
+        Write-Host "  [OK] Sign-in blocked (accountEnabled = false)." -ForegroundColor Green
         $SignInBlocked = "Yes"
     }
     catch {
