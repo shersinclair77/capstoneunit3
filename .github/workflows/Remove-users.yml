@@ -1,0 +1,110 @@
+# =============================================================================
+# Remove-users.yml
+# GitHub Actions workflow — M365 User Offboarding
+#
+# Removes license, removes from all groups, and blocks sign-in.
+#
+# Triggers:
+#   - Manual (workflow_dispatch) with optional CSV path override
+#   - On push to main when offboarding CSV changes
+#
+# Notification email: RenaeHarewood@Renah.onmicrosoft.com
+# Audit log: uploaded as artifact → Actions tab → run → Artifacts
+# =============================================================================
+
+name: M365 User Offboarding
+
+on:
+  workflow_dispatch:
+    inputs:
+      csv_path:
+        description: 'Path to offboarding CSV (relative to repo root)'
+        required: false
+        default: './offboarding/users-to-offboard.csv'
+
+  push:
+    branches: [main]
+    paths:
+      - 'offboarding/users-to-offboard.csv'
+
+jobs:
+  # ── Job 1: Run Pester test suite ─────────────────────────────────────────
+  # Offboarding CANNOT start unless all tests pass.
+  test:
+    name: Pester Quality Gate
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PowerShell modules
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Microsoft.Graph        -Scope CurrentUser -Force
+          Install-Module Pester                 -Scope CurrentUser -Force -SkipPublisherCheck
+
+      - name: Run Pester test suite
+        shell: pwsh
+        run: |
+          $result = Invoke-Pester `
+            -Path './tests/M365Provisioning.Tests.ps1' `
+            -Output Detailed `
+            -PassThru
+          $result | Export-JUnitReport -Path './test-results/results.xml'
+          if ($result.FailedCount -gt 0) {
+            Write-Error "$($result.FailedCount) test(s) failed. Offboarding blocked."
+            exit 1
+          }
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: pester-test-results-offboard-${{ github.run_id }}
+          path: ./test-results/results.xml
+          retention-days: 90
+
+  # ── Job 2: Offboard users (only runs if all tests pass) ──────────────────
+  offboard:
+    name: Offboard M365 Users
+    runs-on: ubuntu-latest
+    needs: test   # <-- quality gate: blocked until test job succeeds
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Install PowerShell modules
+        shell: pwsh
+        run: |
+          Set-PSRepository PSGallery -InstallationPolicy Trusted
+          Install-Module Microsoft.Graph -Scope CurrentUser -Force
+
+      - name: Run offboarding script
+        shell: pwsh
+        env:
+          M365_TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
+          M365_CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
+          M365_CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRET }}
+        run: |
+          ./scripts/Remove-M365Users.ps1 `
+            -TenantId          $env:M365_TENANT_ID `
+            -ClientId          $env:M365_CLIENT_ID `
+            -ClientSecret      $env:M365_CLIENT_SECRET `
+            -NotificationEmail "RenaeHarewood@Renah.onmicrosoft.com" `
+            -RunId             "${{ github.run_id }}" `
+            -CommitSha         "${{ github.sha }}" `
+            -CsvPath           "${{ github.event.inputs.csv_path || './offboarding/users-to-offboard.csv' }}"
+
+      # ── Upload audit log as artifact ────────────────────────────────────
+      # Accessible from: Actions tab → this run → Artifacts section (bottom of page)
+      # Retained for 90 days.
+      - name: Upload audit log artifact
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: offboarding-audit-log-${{ github.run_id }}
+          path: ./audit-logs/
+          retention-days: 90
