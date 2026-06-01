@@ -1,4 +1,3 @@
-
 # =============================================================================
 # Create-M365Users.ps1
 # Creates M365 users with licenses, group membership, MFA, and password policies
@@ -16,57 +15,57 @@
 #   - Application.Read.All                     (secret expiry check)
 #   - Policy.Read.All                           (Security Defaults pre-flight check)
 # =============================================================================
- 
+
 param (
     [Parameter(Mandatory = $true)]
     [string]$TenantId,
- 
+
     [Parameter(Mandatory = $true)]
     [string]$ClientId,
- 
+
     [Parameter(Mandatory = $true)]
     [string]$ClientSecret,
- 
+
     [Parameter(Mandatory = $true)]
     [string]$NotificationEmail,
- 
+
     [Parameter(Mandatory = $false)]
     [string]$RunId = "local",
- 
+
     [Parameter(Mandatory = $false)]
     [string]$CommitSha = "local",
- 
+
     [Parameter(Mandatory = $false)]
     [string]$CsvPath = "./onboarding/users-to-onboard.csv"
 )
- 
+
 # =============================================================================
 # CONFIGURATION
 # =============================================================================
- 
+
 $Domain           = "renah.onmicrosoft.com"
 $LicenseSkuId     = "SPB"
 $UsageLocation    = "BB"
 $PasswordPolicies = "DisablePasswordExpiration"
 $SenderEmail      = $NotificationEmail  # Uses RenaeHarewood@Renah.onmicrosoft.com — a known valid licensed mailbox
 $SecretExpiryWarningDays = 30
- 
+
 $RunTimestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
 $AuditLogPath = "./audit-logs/provisioning_$RunTimestamp.csv"
 New-Item -ItemType Directory -Force -Path "./audit-logs" | Out-Null
- 
+
 # =============================================================================
 # LOAD USERS FROM CSV
 # =============================================================================
- 
+
 if (-not (Test-Path $CsvPath)) {
     Write-Error "Onboarding CSV not found at: $CsvPath"
     exit 1
 }
- 
+
 $CsvData = Import-Csv -Path $CsvPath
 Write-Host "Loaded $($CsvData.Count) user(s) from CSV: $CsvPath" -ForegroundColor Cyan
- 
+
 $Users = $CsvData | ForEach-Object {
     @{
         FirstName  = $_.FirstName.Trim()
@@ -78,11 +77,11 @@ $Users = $CsvData | ForEach-Object {
                      } else { $null }
     }
 }
- 
+
 # =============================================================================
 # HELPERS
 # =============================================================================
- 
+
 function New-RandomPassword {
     $upper   = [char[]]"ABCDEFGHIJKLMNOPQRSTUVWXYZ" | Get-Random -Count 3
     $lower   = [char[]]"abcdefghijklmnopqrstuvwxyz" | Get-Random -Count 5
@@ -91,15 +90,15 @@ function New-RandomPassword {
     $all     = ($upper + $lower + $digits + $special) | Sort-Object { Get-Random }
     return -join $all
 }
- 
+
 function Send-EmailNotification {
     param ([string]$Subject, [string]$Body)
- 
+
     # SenderEmail is set to $NotificationEmail (RenaeHarewood@Renah.onmicrosoft.com).
     # The Graph API sendMail endpoint requires the sender to be a real licensed
     # Exchange Online mailbox. admin@domain was previously used but does not exist.
     # Requires: Mail.Send (Application) permission with admin consent.
- 
+
     try {
         $EmailPayload = @{
             message = @{
@@ -129,7 +128,7 @@ function Send-EmailNotification {
         Write-Warning "  Check: Sender mailbox exists and has Exchange Online license."
     }
 }
- 
+
 # =============================================================================
 # Set-UserMfaEnforced  — FIXED
 # -----------------------------------------------------------------------------
@@ -162,13 +161,13 @@ function Send-EmailNotification {
 #   Policy.ReadWrite.AuthenticationMethod   — Steps 1 & 2
 #   UserAuthenticationMethod.ReadWrite.All  — Step 3 (TAP)
 # =============================================================================
- 
+
 function Set-UserMfaEnforced {
     param (
         [Parameter(Mandatory = $true)] [string]$UserId,
         [Parameter(Mandatory = $true)] [string]$UPN
     )
- 
+
     # ─────────────────────────────────────────────────────────────────────────
     # Per-user MFA state APIs (both beta strongAuthenticationRequirements and
     # v1.0 authentication/requirements) return BadRequest for this tenant.
@@ -190,14 +189,14 @@ function Set-UserMfaEnforced {
     #
     # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
     # ─────────────────────────────────────────────────────────────────────────
- 
+
     $TapUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/temporaryAccessPassMethods"
- 
+
     # Propagation delay — new accounts need time to replicate before
     # authentication method writes are accepted.
     Write-Host "  [MFA] Waiting 10 s for account propagation..." -ForegroundColor DarkGray
     Start-Sleep -Seconds 10
- 
+
     # Remove any existing TAP first (only one can be active at a time)
     try {
         $existing = Invoke-MgGraphRequest -Method GET -Uri $TapUri -ErrorAction SilentlyContinue
@@ -205,7 +204,7 @@ function Set-UserMfaEnforced {
             Invoke-MgGraphRequest -Method DELETE -Uri "$TapUri/$($tap.id)" -ErrorAction SilentlyContinue
         }
     } catch { }
- 
+
     # Issue TAP — one-use, 60-minute credential for first login
     try {
         $tap     = Invoke-MgGraphRequest `
@@ -214,12 +213,12 @@ function Set-UserMfaEnforced {
                        -ContentType "application/json" `
                        -Body (@{ isUsableOnce = $true; lifetimeInMinutes = 60 } | ConvertTo-Json -Depth 3)
         $TapCode = $tap.temporaryAccessPass
- 
+
         Write-Host "  [OK] TAP issued for $UPN (expires 60 min)." -ForegroundColor Green
         Write-Host "       TAP code (share securely with user): $TapCode" -ForegroundColor Magenta
         Write-Host "       On first sign-in the CA policy will require MFA registration." -ForegroundColor Magenta
         Write-Host "       User must complete MFA setup before the TAP expires." -ForegroundColor Magenta
- 
+
         return "TAP issued — MFA enforced via CA policy"
     }
     catch {
@@ -234,7 +233,38 @@ function Set-UserMfaEnforced {
         return "TAP failed — user must register MFA on first login via CA policy"
     }
 }
- 
+
+# =============================================================================
+# CONNECT TO MICROSOFT GRAPH
+# =============================================================================
+
+Write-Host "`nConnecting to Microsoft Graph..." -ForegroundColor Cyan
+
+try {
+    $SecureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+    $Credential   = New-Object System.Management.Automation.PSCredential($ClientId, $SecureSecret)
+
+    Connect-MgGraph `
+        -TenantId $TenantId `
+        -ClientSecretCredential $Credential `
+        -NoWelcome `
+        -ErrorAction Stop
+
+    # Verify the connection is live before proceeding
+    $ctx = Get-MgContext
+    if (-not $ctx -or -not $ctx.TenantId) {
+        throw "Connect-MgGraph returned no context — credentials may be incorrect."
+    }
+    Write-Host "  [OK] Connected as AppOnly to tenant: $($ctx.TenantId)" -ForegroundColor Green
+}
+catch {
+    Write-Host ""
+    Write-Host "  [FATAL] Could not connect to Microsoft Graph: $_" -ForegroundColor Red
+    Write-Host "  Check that TENANT_ID, CLIENT_ID, and CLIENT_SECRET are correct" -ForegroundColor Red
+    Write-Host "  and that the App Registration client secret has not expired." -ForegroundColor Red
+    exit 1
+}
+
 # =============================================================================
 # PRE-FLIGHT: SECURITY DEFAULTS CHECK
 # -----------------------------------------------------------------------------
@@ -243,14 +273,14 @@ function Set-UserMfaEnforced {
 # return HTTP 200 but are silently discarded — the state stays "disabled".
 # This is the most common reason MFA appears as disabled after provisioning.
 # =============================================================================
- 
+
 Write-Host "`nRunning pre-flight checks..." -ForegroundColor Cyan
- 
+
 try {
     $SecDefaults = Invoke-MgGraphRequest `
         -Method GET `
         -Uri "https://graph.microsoft.com/v1.0/policies/identitySecurityDefaultsEnforcementPolicy"
- 
+
     if ($SecDefaults.isEnabled -eq $true) {
         Write-Host ""
         Write-Host "  ╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
@@ -268,7 +298,7 @@ try {
         Write-Host "  ║  to require MFA for all users so tenant security is maintained. ║" -ForegroundColor Red
         Write-Host "  ╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
         Write-Host ""
- 
+
         # Send alert email before exiting
         $SecDefaultsAlertBody = @"
 <h2 style='color:#C0392B;font-family:Calibri,sans-serif'>⛔ Provisioning Blocked: Security Defaults Enabled</h2>
@@ -297,7 +327,7 @@ but are silently discarded — the per-user MFA state remains <b>disabled</b>.
         Send-EmailNotification `
             -Subject "BLOCKED: M365 Provisioning Failed — Security Defaults Enabled ($RunTimestamp)" `
             -Body $SecDefaultsAlertBody
- 
+
         Disconnect-MgGraph | Out-Null
         exit 1
     }
@@ -312,22 +342,22 @@ catch {
     Write-Warning "  Continuing — if MFA states remain disabled after this run, Security Defaults"
     Write-Warning "  is likely enabled. Disable it in Entra admin center and re-run."
 }
- 
+
 # =============================================================================
 # SECRET EXPIRY CHECK
 # =============================================================================
- 
+
 Write-Host "`nChecking client secret expiry..." -ForegroundColor Cyan
- 
+
 try {
     $App     = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$ClientId'"
     $AppId   = $App.value[0].id
     $Secrets = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications/$AppId"
- 
+
     foreach ($Secret in $Secrets.passwordCredentials) {
         $ExpiryDate = [datetime]$Secret.endDateTime
         $DaysLeft   = ($ExpiryDate - (Get-Date)).Days
- 
+
         if ($DaysLeft -le $SecretExpiryWarningDays) {
             Write-Warning "Client secret expires in $DaysLeft day(s). Sending alert..."
             $ExpiryBody = @"
@@ -352,41 +382,41 @@ try {
 catch {
     Write-Warning "Could not check secret expiry: $_"
 }
- 
+
 # =============================================================================
 # RESOLVE LICENSE SKU
 # =============================================================================
- 
+
 Write-Host "`nResolving license SKU for '$LicenseSkuId'..." -ForegroundColor Cyan
- 
+
 $Sku = Get-MgSubscribedSku | Where-Object { $_.SkuPartNumber -eq $LicenseSkuId }
- 
+
 if (-not $Sku) {
     Write-Error "License SKU '$LicenseSkuId' not found in tenant."
     exit 1
 }
- 
+
 Write-Host "License SKU resolved: $($Sku.SkuId)" -ForegroundColor Green
- 
+
 # =============================================================================
 # CREATE USERS
 # =============================================================================
- 
+
 $Results = @()
 $Created = 0
 $Skipped = 0
 $Failed  = 0
- 
+
 foreach ($User in $Users) {
     $UPN          = "$($User.FirstName.ToLower()).$($User.LastName.ToLower())@$Domain"
     $DisplayName  = "$($User.FirstName) $($User.LastName)"
     $TempPassword = New-RandomPassword
- 
+
     Write-Host "`nProcessing: $DisplayName ($UPN)" -ForegroundColor Cyan
- 
+
     # --- Duplicate check ---
     $Existing = Get-MgUser -Filter "userPrincipalName eq '$UPN'" -ErrorAction SilentlyContinue
- 
+
     if ($Existing) {
         Write-Warning "User $UPN already exists. Skipping."
         $Results += [PSCustomObject]@{
@@ -405,7 +435,7 @@ foreach ($User in $Users) {
         $Skipped++
         continue
     }
- 
+
     # --- Create account ---
     try {
         $NewUser = New-MgUser -BodyParameter @{
@@ -444,7 +474,7 @@ foreach ($User in $Users) {
         $Failed++
         continue
     }
- 
+
     # --- License ---
     $LicenseStatus = "Failed"
     try {
@@ -455,7 +485,7 @@ foreach ($User in $Users) {
     catch {
         Write-Warning "  License assignment failed: $_"
     }
- 
+
     # --- Groups ---
     if ($User.GroupIds) {
         foreach ($GroupId in $User.GroupIds) {
@@ -468,10 +498,10 @@ foreach ($User in $Users) {
             }
         }
     }
- 
+
     # --- MFA (fixed function — three independent steps with verification) ---
     $MfaStatus = Set-UserMfaEnforced -UserId $NewUser.Id -UPN $UPN
- 
+
     # --- Audit entry ---
     $Results += [PSCustomObject]@{
         Timestamp       = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
@@ -488,19 +518,19 @@ foreach ($User in $Users) {
     }
     $Created++
 }
- 
+
 # =============================================================================
 # WRITE AUDIT LOG
 # =============================================================================
- 
+
 Write-Host "`nWriting audit log to $AuditLogPath..." -ForegroundColor Cyan
 $Results | Export-Csv -Path $AuditLogPath -NoTypeInformation
 Write-Host "  [OK] Audit log written." -ForegroundColor Green
- 
+
 # =============================================================================
 # CONSOLE SUMMARY
 # =============================================================================
- 
+
 Write-Host "`n========================================" -ForegroundColor Yellow
 Write-Host "         USER PROVISIONING SUMMARY"       -ForegroundColor Yellow
 Write-Host "========================================" -ForegroundColor Yellow
@@ -512,23 +542,23 @@ Write-Host "  Skipped  : $Skipped"
 Write-Host "  Failed   : $Failed"
 Write-Host "========================================" -ForegroundColor Yellow
 $Results | Format-Table Timestamp, DisplayName, UPN, Status, MFA, LicenseAssigned -AutoSize
- 
+
 Write-Host "`nNOTE: Users with TAP must register an MFA method within 60 minutes." -ForegroundColor Magenta
 Write-Host "NOTE: Any MFA status containing 'manual action required' needs follow-up in Entra." -ForegroundColor Red
- 
+
 # =============================================================================
 # EMAIL SUMMARY
 # =============================================================================
- 
+
 Write-Host "`nSending provisioning summary email to $NotificationEmail..." -ForegroundColor Cyan
- 
+
 $TableRows = $Results | ForEach-Object {
     $mfaColor = if ($_.MFA -like "Enforced*") { "#e6f4ea" }
                 elseif ($_.MFA -like "*FAILED*" -or $_.MFA -like "*manual action*") { "#fce8e6" }
                 else { "#fff8e1" }
     "<tr style='background:$mfaColor'><td>$($_.DisplayName)</td><td>$($_.UPN)</td><td>$($_.Status)</td><td>$($_.MFA)</td><td>$($_.LicenseAssigned)</td></tr>"
 }
- 
+
 $SummaryBody = @"
 <h2 style='color:#1A3C5E;font-family:Calibri,sans-serif'>M365 User Provisioning Summary</h2>
 <p style='font-family:Calibri,sans-serif'>
@@ -555,10 +585,10 @@ $SummaryBody = @"
   <i>Audit log (CSV) is saved as a downloadable artifact in the GitHub Actions run linked to commit $CommitSha.</i>
 </p>
 "@
- 
+
 Send-EmailNotification `
     -Subject "M365 Provisioning Complete — $Created Created, $Skipped Skipped, $Failed Failed ($RunTimestamp)" `
     -Body $SummaryBody
- 
+
 Disconnect-MgGraph | Out-Null
 Write-Host "Disconnected from Microsoft Graph." -ForegroundColor Cyan
