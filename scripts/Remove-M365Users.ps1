@@ -36,7 +36,13 @@ param (
     [Parameter(Mandatory = $false)] [string]$NotificationEmail = "RenaeHarewood@Renah.onmicrosoft.com",
     [Parameter(Mandatory = $false)] [string]$RunId    = "local",
     [Parameter(Mandatory = $false)] [string]$CommitSha = "local",
-    [Parameter(Mandatory = $false)] [string]$CsvPath  = "./offboarding/users-to-offboard.csv"
+    [Parameter(Mandatory = $false)] [string]$CsvPath  = "./offboarding/users-to-offboard.csv",
+
+    # Set to $true when mailboxes have already been converted manually in
+    # Microsoft 365 admin center (Users > Convert to shared mailbox).
+    # This bypasses the Exchange Online REST API call which requires
+    # delegated auth and cannot be performed with app-only credentials.
+    [Parameter(Mandatory = $false)] [switch]$SkipMailboxConversion
 )
 
 # =============================================================================
@@ -391,19 +397,38 @@ foreach ($Row in $CsvData) {
     $OverallStatus   = "Completed"
 
     # ── STEP 1: Convert mailbox to Shared ────────────────────────────────────
+    # The Exchange Online REST API (adminapi/beta) requires a delegated (user)
+    # token and cannot be called with app-only credentials. When -SkipMailboxConversion
+    # is set, the conversion is assumed to have been done manually in the
+    # Microsoft 365 admin center before this workflow was triggered.
     Write-Host "`n  [Step 1/6] Converting mailbox to Shared..." -ForegroundColor Cyan
-    $MailboxConverted = Convert-ToSharedMailbox -UPN $UPN
+
+    if ($SkipMailboxConversion) {
+        Write-Host "  [--] -SkipMailboxConversion set — assuming mailbox was already" -ForegroundColor DarkGray
+        Write-Host "       converted manually in Microsoft 365 admin center." -ForegroundColor DarkGray
+        $MailboxConverted = "Skipped — manually confirmed"
+    }
+    else {
+        $MailboxConverted = Convert-ToSharedMailbox -UPN $UPN
+    }
 
     # HARD STOP — do not remove license if conversion failed.
-    # Removing license before conversion starts a 30-day Exchange soft-delete
-    # that permanently destroys all mailbox data.
+    # Removing the license before converting starts a 30-day Exchange soft-delete
+    # countdown that permanently destroys all mailbox data.
     if ($MailboxConverted -like "Failed*") {
         Write-Host ""
         Write-Host "  !! BLOCKED: License removal skipped — mailbox not converted. !!" -ForegroundColor Red
-        Write-Host "  Reason   : $MailboxConverted" -ForegroundColor Red
-        Write-Host "  Action   : Fix the Exchange permission/role then re-run." -ForegroundColor Red
+        Write-Host "  Reason : $MailboxConverted" -ForegroundColor Red
         Write-Host ""
-        $LicenseRemoved  = "SKIPPED — mailbox not converted"
+        Write-Host "  The Exchange Online REST API (adminapi/beta) requires a delegated" -ForegroundColor Yellow
+        Write-Host "  (user) token and cannot be called with app-only credentials." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  TO COMPLETE THIS OFFBOARDING:" -ForegroundColor Yellow
+        Write-Host "  1. Go to Microsoft 365 admin center > Users > Active users" -ForegroundColor Yellow
+        Write-Host "  2. Select $UPN > three-dot menu > Convert to shared mailbox" -ForegroundColor Yellow
+        Write-Host "  3. Re-run this workflow with SkipMailboxConversion = true" -ForegroundColor Yellow
+        Write-Host ""
+        $LicenseRemoved  = "SKIPPED — convert mailbox first, then re-run with SkipMailboxConversion=true"
         $SignInBlocked   = "SKIPPED"
         $SessionsRevoked = "SKIPPED"
         $GroupsRemoved   = "SKIPPED"
