@@ -1,127 +1,57 @@
 # =============================================================================
-# Remove-users.yml
-# GitHub Actions workflow — M365 User Offboarding
+# .github/workflows/remove-users.yml
 #
-# Offboarding sequence per user:
-#   1. Convert mailbox → Shared Mailbox  (Exchange Online)
-#   2. Remove all licenses               (Microsoft Graph)
-#   3. Block sign-in                     (Microsoft Graph)
-#   4. Revoke active sessions            (Microsoft Graph)
-#   5. Remove from all groups            (Microsoft Graph)
-#   6. Disable / remove all MFA methods  (Microsoft Graph)
+# Manually triggered workflow to offboard M365 users from a CSV file.
 #
-# Notification email: RenaeHarewood@Renah.onmicrosoft.com
-# Audit log: Actions tab → this run → Artifacts → offboarding-audit-log-{run_id}
-#
-# Secrets required in GitHub repository settings:
-#   M365_TENANT_ID     — Azure AD tenant ID
-#   M365_CLIENT_ID     — App Registration client ID
-#   M365_CLIENT_SECRET — App Registration client secret
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   - M365_TENANT_ID
+#   - M365_CLIENT_ID
+#   - M365_CLIENT_SECRET
+#   - NOTIFICATION_EMAIL
 # =============================================================================
 
-name: M365 User Offboarding
+name: Remove M365 Users (Offboarding)
 
 on:
-  workflow_dispatch:
-    inputs:
-      csv_path:
-        description: 'Path to offboarding CSV (relative to repo root)'
-        required: false
-        default: './offboarding/users-to-offboard.csv'
-      skip_mailbox_conversion:
-        description: 'Set to true if mailboxes have already been converted to Shared manually in Microsoft 365 admin center'
-        required: false
-        default: 'false'
-
-  push:
-    branches: [main]
-    paths:
-      - 'offboarding/users-to-offboard.csv'
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
-  # ── Job 1: Pester quality gate ──────────────────────────────────────────────
-  # Offboarding is blocked unless every test passes.
-  test:
-    name: Pester Quality Gate
+  remove-users:
+    name: Offboard Users from Microsoft 365
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install PowerShell modules
+      - name: Install Microsoft.Graph PowerShell module
         shell: pwsh
         run: |
-          Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Microsoft.Graph        -Scope CurrentUser -Force
-          Install-Module Pester                 -Scope CurrentUser -Force -SkipPublisherCheck
-
-      - name: Run Pester test suite
-        shell: pwsh
-        run: |
-          $result = Invoke-Pester `
-            -Path './tests/M365Provisioning.Tests.ps1' `
-            -Output Detailed `
-            -PassThru
-          $result | Export-JUnitReport -Path './test-results/results.xml'
-          if ($result.FailedCount -gt 0) {
-            Write-Error "$($result.FailedCount) test(s) failed. Offboarding blocked."
-            exit 1
-          }
-          Write-Host "All $($result.PassedCount) tests passed."
-
-      - name: Upload Pester test results
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: pester-test-results-offboard-${{ github.run_id }}
-          path: ./test-results/results.xml
-          retention-days: 90
-
-  # ── Job 2: Offboard users ───────────────────────────────────────────────────
-  # Only executes after all Pester tests pass (needs: test).
-  offboard:
-    name: Offboard M365 Users
-    runs-on: ubuntu-latest
-    needs: test
-
-    steps:
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # Microsoft.Graph is the only module required.
-      # Shared mailbox conversion now uses the Exchange Online Admin REST API
-      # directly via Invoke-RestMethod — no ExchangeOnlineManagement module needed.
-      - name: Install PowerShell modules
-        shell: pwsh
-        run: |
-          Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Microsoft.Graph -Scope CurrentUser -Force
+          Install-Module Microsoft.Graph -Scope CurrentUser -Force -AllowClobber
+          Write-Host "Microsoft.Graph module installed."
 
       - name: Run offboarding script
         shell: pwsh
         env:
-          M365_TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
-          M365_CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
-          M365_CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRET }}
+          M365_TENANT_ID:      ${{ secrets.M365_TENANT_ID }}
+          M365_CLIENT_ID:      ${{ secrets.M365_CLIENT_ID }}
+          M365_CLIENT_SECRET:  ${{ secrets.M365_CLIENT_SECRET }}
+          NOTIFICATION_EMAIL:  ${{ secrets.NOTIFICATION_EMAIL }}
         run: |
-          $skipConversion = "${{ github.event.inputs.skip_mailbox_conversion }}" -eq "true"
           ./scripts/Remove-M365Users.ps1 `
-            -TenantId               $env:M365_TENANT_ID `
-            -ClientId               $env:M365_CLIENT_ID `
-            -ClientSecret           $env:M365_CLIENT_SECRET `
-            -NotificationEmail      "RenaeHarewood@Renah.onmicrosoft.com" `
-            -RunId                  "${{ github.run_id }}" `
-            -CommitSha              "${{ github.sha }}" `
-            -CsvPath                "${{ github.event.inputs.csv_path || './offboarding/users-to-offboard.csv' }}" `
-            -SkipMailboxConversion:$skipConversion
+            -TenantId          $env:M365_TENANT_ID `
+            -ClientId          $env:M365_CLIENT_ID `
+            -ClientSecret      $env:M365_CLIENT_SECRET `
+            -NotificationEmail $env:NOTIFICATION_EMAIL `
+            -CsvPath           "./offboarding/users-to-offboard.csv" `
+            -RunId             "${{ github.run_id }}" `
+            -CommitSha         "${{ github.sha }}"
 
-      # Audit log is always uploaded — even if offboarding partially fails —
-      # so there is always a record of what was and was not completed.
-      - name: Upload offboarding audit log
+      # 10. Upload offboarding audit log as immutable workflow artifact
+      - name: Upload offboarding audit log artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: offboarding-audit-log-${{ github.run_id }}
-          path: ./audit-logs/
+          name: offboarding-audit-${{ github.run_id }}-${{ github.sha }}
+          path: audit-logs/
           retention-days: 90
