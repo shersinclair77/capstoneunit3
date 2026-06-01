@@ -1,61 +1,57 @@
 # =============================================================================
-# .github/workflows/Remove-licenses-and-groups.yml
+# .github/workflows/remove-users.yml
 #
-# Removes all licenses and group memberships from users listed in the
-# onboarding CSV. Reads FirstName/LastName columns and builds UPNs
-# automatically — no separate CSV needed.
+# Manually triggered workflow to offboard M365 users from a CSV file.
 #
-# Does NOT: delete accounts, block sign-in, convert mailboxes, or modify MFA.
-#
-# Secrets required:
-#   M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET
+# Required GitHub Secrets (Settings → Secrets and variables → Actions):
+#   - M365_TENANT_ID
+#   - M365_CLIENT_ID
+#   - M365_CLIENT_SECRET
+#   - NOTIFICATION_EMAIL
 # =============================================================================
 
-name: Remove User Licenses and Groups
+name: Remove M365 Users (Offboarding)
 
 on:
-  workflow_dispatch:
-    inputs:
-      csv_path:
-        description: 'Path to onboarding CSV containing the users to clean up'
-        required: false
-        default: './onboarding/users-to-onboard.csv'
+  workflow_dispatch:  # Manual trigger only
 
 jobs:
-  cleanup:
-    name: Remove Licenses and Groups
+  remove-users:
+    name: Offboard Users from Microsoft 365
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Install Microsoft.Graph module
+      - name: Install Microsoft.Graph PowerShell module
         shell: pwsh
         run: |
-          Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Microsoft.Graph -Scope CurrentUser -Force
+          Install-Module Microsoft.Graph -Scope CurrentUser -Force -AllowClobber
+          Write-Host "Microsoft.Graph module installed."
 
-      - name: Run cleanup script
+      - name: Run offboarding script
         shell: pwsh
         env:
-          M365_TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
-          M365_CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
-          M365_CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRET }}
+          M365_TENANT_ID:      ${{ secrets.M365_TENANT_ID }}
+          M365_CLIENT_ID:      ${{ secrets.M365_CLIENT_ID }}
+          M365_CLIENT_SECRET:  ${{ secrets.M365_CLIENT_SECRET }}
+          NOTIFICATION_EMAIL:  ${{ secrets.NOTIFICATION_EMAIL }}
         run: |
-          ./scripts/Remove-UserLicensesAndGroups.ps1 `
+          ./scripts/Remove-M365Users.ps1 `
             -TenantId          $env:M365_TENANT_ID `
             -ClientId          $env:M365_CLIENT_ID `
             -ClientSecret      $env:M365_CLIENT_SECRET `
-            -NotificationEmail "RenaeHarewood@Renah.onmicrosoft.com" `
+            -NotificationEmail $env:NOTIFICATION_EMAIL `
+            -CsvPath           "./offboarding/users-to-offboard.csv" `
             -RunId             "${{ github.run_id }}" `
-            -CommitSha         "${{ github.sha }}" `
-            -CsvPath           "${{ github.event.inputs.csv_path || './onboarding/users-to-onboard.csv' }}"
+            -CommitSha         "${{ github.sha }}"
 
-      - name: Upload audit log
+      # 10. Upload offboarding audit log as immutable workflow artifact
+      - name: Upload offboarding audit log artifact
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: cleanup-audit-log-${{ github.run_id }}
-          path: ./audit-logs/
+          name: offboarding-audit-${{ github.run_id }}-${{ github.sha }}
+          path: audit-logs/
           retention-days: 90
