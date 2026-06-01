@@ -133,44 +133,28 @@ function Convert-ToSharedMailbox {
 
     Write-Host "  Converting mailbox to Shared..." -ForegroundColor Cyan
 
-    # ── Acquire Exchange Online access token ─────────────────────────────────
-    try {
-        $tokenBody = @{
-            grant_type    = "client_credentials"
-            client_id     = $ClientId
-            client_secret = $ClientSecret
-            scope         = "https://outlook.office365.com/.default"
-        }
-        $tokenResponse = Invoke-RestMethod `
-            -Method POST `
-            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
-            -ContentType "application/x-www-form-urlencoded" `
-            -Body $tokenBody
-
-        if (-not $tokenResponse.access_token) {
-            throw "Token response did not contain an access_token."
-        }
-    }
-    catch {
-        Write-Warning "  Could not acquire Exchange Online token: $_"
-        return "Failed — token error"
-    }
-
     # ── Connect to Exchange Online (app-only, no MFA prompt) ─────────────────
-    # ExchangeOnlineManagement v3+ requires AccessToken as SecureString.
-    # Converting here handles both v2 (plain string) and v3 (SecureString).
+    # Uses -ClientSecret parameter introduced in ExchangeOnlineManagement v3.2.
+    # This avoids the deprecated -AccessToken approach which changed behaviour
+    # across module versions. The workflow pins the module to >= 3.2.0.
+    # Requires:
+    #   - App Registration permission: Exchange.ManageAsApp (Application)
+    #   - Entra role on App Service Principal: Exchange Recipient Administrator
     try {
-        $secureToken = $tokenResponse.access_token | ConvertTo-SecureString -AsPlainText -Force
+        $SecureEXOSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
         Connect-ExchangeOnline `
-            -AccessToken $secureToken `
-            -Organization $Domain `
             -AppId $ClientId `
+            -ClientSecret $SecureEXOSecret `
+            -Organization $Domain `
             -ShowBanner:$false `
             -ErrorAction Stop
         Write-Host "  [OK] Connected to Exchange Online." -ForegroundColor Green
     }
     catch {
-        Write-Warning "  Could not connect to Exchange Online: $_"
+        Write-Warning "  Could not connect to Exchange Online: $($_.Exception.Message)"
+        Write-Warning "  Verify: Exchange.ManageAsApp permission + admin consent on App Registration"
+        Write-Warning "  Verify: Exchange Recipient Administrator role assigned to App Service Principal"
+        Write-Warning "  Entra: App registrations > your app > API permissions"
         return "Failed — EXO connection error"
     }
 
