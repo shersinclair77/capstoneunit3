@@ -85,15 +85,14 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # Install both Microsoft Graph and Exchange Online Management modules.
-      # ExchangeOnlineManagement is required for the shared mailbox conversion
-      # step (Set-Mailbox -Type Shared) which is not available via Graph API.
+      # Microsoft.Graph is the only module required.
+      # Shared mailbox conversion now uses the Exchange Online Admin REST API
+      # directly via Invoke-RestMethod — no ExchangeOnlineManagement module needed.
       - name: Install PowerShell modules
         shell: pwsh
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
-          Install-Module Microsoft.Graph          -Scope CurrentUser -Force
-          Install-Module ExchangeOnlineManagement -MinimumVersion 3.2.0 -Scope CurrentUser -Force
+          Install-Module Microsoft.Graph -Scope CurrentUser -Force
 
       - name: Run offboarding script
         shell: pwsh
