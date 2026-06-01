@@ -239,7 +239,7 @@ function Disable-UserMfa {
         @{ Name = "Software OATH (TOTP)";    Uri = "$BaseUri/softwareOathMethods"            },
         @{ Name = "Temp Access Pass (TAP)";  Uri = "$BaseUri/temporaryAccessPassMethods"     },
         @{ Name = "FIDO2 Security Key";      Uri = "$BaseUri/fido2Methods"                   },
-        @{ Name = "Windows Hello";           Uri = "$BaseUri/windowsHelloForBusinessMethods" },
+        @{ Name = "Windows Hello";           Uri = "$BaseUri/windowsHelloForBusinessMethods" }
     )
 
     foreach ($ep in $methodEndpoints) {
