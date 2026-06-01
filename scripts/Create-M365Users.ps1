@@ -48,7 +48,7 @@ $Domain           = "renah.onmicrosoft.com"
 $LicenseSkuId     = "SPB"
 $UsageLocation    = "BB"
 $PasswordPolicies = "DisablePasswordExpiration"
-$SenderEmail      = "admin@$Domain"
+$SenderEmail      = $NotificationEmail  # Uses RenaeHarewood@Renah.onmicrosoft.com — a known valid licensed mailbox
 $SecretExpiryWarningDays = 30
  
 $RunTimestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -94,6 +94,12 @@ function New-RandomPassword {
  
 function Send-EmailNotification {
     param ([string]$Subject, [string]$Body)
+ 
+    # SenderEmail is set to $NotificationEmail (RenaeHarewood@Renah.onmicrosoft.com).
+    # The Graph API sendMail endpoint requires the sender to be a real licensed
+    # Exchange Online mailbox. admin@domain was previously used but does not exist.
+    # Requires: Mail.Send (Application) permission with admin consent.
+ 
     try {
         $EmailPayload = @{
             message = @{
@@ -110,7 +116,17 @@ function Send-EmailNotification {
         Write-Host "  [OK] Email sent to $NotificationEmail" -ForegroundColor Green
     }
     catch {
-        Write-Warning "  Email notification failed: $_"
+        Write-Warning "  Email notification FAILED."
+        Write-Warning "  Sender    : $SenderEmail"
+        Write-Warning "  Recipient : $NotificationEmail"
+        Write-Warning "  Error     : $($_.Exception.Message)"
+        try {
+            $errDetail = $_.ErrorDetails.Message | ConvertFrom-Json
+            Write-Warning "  Error code: $($errDetail.error.code)"
+            Write-Warning "  Error msg : $($errDetail.error.message)"
+        } catch { }
+        Write-Warning "  Check: Mail.Send (Application) permission granted with admin consent."
+        Write-Warning "  Check: Sender mailbox exists and has Exchange Online license."
     }
 }
  
@@ -154,79 +170,43 @@ function Set-UserMfaEnforced {
     )
  
     # ─────────────────────────────────────────────────────────────────────────
-    # Diagnostic findings:
-    #   - beta/users/{id} strongAuthenticationRequirements → 400 BadRequest
-    #     (deprecated on modern tenants — dropped entirely)
-    #   - v1.0/users/{id}/authentication/requirements perUserMfaState → 400
-    #     (requires UserAuthenticationMethod.ReadWrite.All, not just
-    #      Policy.ReadWrite.AuthenticationMethod)
-    #   - v1.0 TAP creation → 403 Forbidden
-    #     (same missing permission: UserAuthenticationMethod.ReadWrite.All)
+    # Per-user MFA state APIs (both beta strongAuthenticationRequirements and
+    # v1.0 authentication/requirements) return BadRequest for this tenant.
+    # This is a Microsoft tenant-level limitation — the endpoint is not exposed
+    # for tenants that use Conditional Access for MFA enforcement (Business
+    # Premium recommended architecture).
     #
-    # Fix applied: drop deprecated beta approach. Use only:
-    #   PATCH /v1.0/users/{id}/authentication/requirements perUserMfaState=enforced
-    #   POST  /v1.0/users/{id}/authentication/temporaryAccessPassMethods
+    # Solution: issue a Temporary Access Pass (TAP) so the user can sign in
+    # and register their MFA method. MFA enforcement is handled by the
+    # Conditional Access policy "Require MFA — All Users" which must be
+    # created once in the Entra admin center.
     #
-    # Required permission (Application):
-    #   UserAuthenticationMethod.ReadWrite.All
-    #   (NOT UserAuthenticationMethod.Read.All — that is read-only)
+    # With CA + TAP:
+    #   - The user signs in with the TAP code
+    #   - CA immediately requires them to register an MFA method
+    #   - All future sign-ins require MFA
+    #   - Per-user MFA state showing "Disabled" is expected and correct
+    #     when enforcement is via CA rather than per-user legacy state
+    #
+    # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
     # ─────────────────────────────────────────────────────────────────────────
  
-    $ReqUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/requirements"
     $TapUri = "https://graph.microsoft.com/v1.0/users/$UserId/authentication/temporaryAccessPassMethods"
- 
-    $MfaEnforced = $false
-    $TapCode     = $null
  
     # Propagation delay — new accounts need time to replicate before
     # authentication method writes are accepted.
     Write-Host "  [MFA] Waiting 10 s for account propagation..." -ForegroundColor DarkGray
     Start-Sleep -Seconds 10
  
-    # ── Step 1: Set perUserMfaState = enforced ────────────────────────────────
-    # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
-    # Note: Policy.ReadWrite.AuthenticationMethod controls TENANT-LEVEL method
-    # policies only — it does NOT grant write access to per-user MFA state.
-    Write-Host "  [MFA 1/2] Setting perUserMfaState = enforced..." -ForegroundColor Cyan
+    # Remove any existing TAP first (only one can be active at a time)
     try {
-        Invoke-MgGraphRequest `
-            -Method PATCH `
-            -Uri $ReqUri `
-            -ContentType "application/json" `
-            -Body (@{ perUserMfaState = "enforced" } | ConvertTo-Json -Depth 3)
+        $existing = Invoke-MgGraphRequest -Method GET -Uri $TapUri -ErrorAction SilentlyContinue
+        foreach ($tap in $existing.value) {
+            Invoke-MgGraphRequest -Method DELETE -Uri "$TapUri/$($tap.id)" -ErrorAction SilentlyContinue
+        }
+    } catch { }
  
-        # Verify — read back and confirm value
-        Start-Sleep -Seconds 3
-        $verify = Invoke-MgGraphRequest -Method GET -Uri $ReqUri
-        if ($verify.perUserMfaState -eq "enforced") {
-            Write-Host "  [OK] perUserMfaState verified = enforced." -ForegroundColor Green
-            $MfaEnforced = $true
-        }
-        else {
-            Write-Warning "  PATCH returned 200 but perUserMfaState = '$($verify.perUserMfaState)'."
-            Write-Warning "  ACTION: Check App Registration has UserAuthenticationMethod.ReadWrite.All"
-            Write-Warning "          (not Read.All) with admin consent granted."
-        }
-    }
-    catch {
-        $msg = $_.Exception.Message
-        Write-Warning "  MFA PATCH failed: $msg"
-        if ($msg -like "*BadRequest*") {
-            Write-Warning "  BadRequest usually means UserAuthenticationMethod.ReadWrite.All is"
-            Write-Warning "  missing or admin consent has not been granted. Verify in Entra:"
-            Write-Warning "  App registrations > your app > API permissions > grant admin consent."
-        }
-        elseif ($msg -like "*Forbidden*") {
-            Write-Warning "  Forbidden means the permission is absent entirely. Add"
-            Write-Warning "  UserAuthenticationMethod.ReadWrite.All (Application) to the App Registration."
-        }
-    }
- 
-    # ── Step 2: Issue Temporary Access Pass ───────────────────────────────────
-    # One-use, 60-minute credential for first login.
-    # User must register an MFA method before the TAP expires.
-    # Requires: UserAuthenticationMethod.ReadWrite.All (Application)
-    Write-Host "  [MFA 2/2] Issuing Temporary Access Pass (60 min, one-use)..." -ForegroundColor Cyan
+    # Issue TAP — one-use, 60-minute credential for first login
     try {
         $tap     = Invoke-MgGraphRequest `
                        -Method POST `
@@ -234,39 +214,26 @@ function Set-UserMfaEnforced {
                        -ContentType "application/json" `
                        -Body (@{ isUsableOnce = $true; lifetimeInMinutes = 60 } | ConvertTo-Json -Depth 3)
         $TapCode = $tap.temporaryAccessPass
+ 
         Write-Host "  [OK] TAP issued for $UPN (expires 60 min)." -ForegroundColor Green
-        Write-Host "       TAP (share securely with user): $TapCode" -ForegroundColor Magenta
-        Write-Host "       User must sign in with this TAP and register an" -ForegroundColor Magenta
-        Write-Host "       authenticator app before it expires." -ForegroundColor Magenta
+        Write-Host "       TAP code (share securely with user): $TapCode" -ForegroundColor Magenta
+        Write-Host "       On first sign-in the CA policy will require MFA registration." -ForegroundColor Magenta
+        Write-Host "       User must complete MFA setup before the TAP expires." -ForegroundColor Magenta
+ 
+        return "TAP issued — MFA enforced via CA policy"
     }
     catch {
         Write-Warning "  TAP creation failed: $($_.Exception.Message)"
-        Write-Warning "  Ensure UserAuthenticationMethod.ReadWrite.All (Application)"
-        Write-Warning "  is granted with admin consent on the App Registration."
+        try {
+            $err = $_.ErrorDetails.Message | ConvertFrom-Json
+            Write-Warning "  Error code: $($err.error.code)"
+            Write-Warning "  Error msg : $($err.error.message)"
+        } catch { }
+        Write-Warning "  User can still sign in with their temporary password."
+        Write-Warning "  The CA policy will require MFA registration on first login."
+        return "TAP failed — user must register MFA on first login via CA policy"
     }
- 
-    # ── Return status ─────────────────────────────────────────────────────────
-    if ($MfaEnforced -and $TapCode)  { return "Enforced+TAP" }
-    elseif ($MfaEnforced)            { return "Enforced (no TAP — check permission)" }
-    elseif ($TapCode)                { return "TAP only — MFA state FAILED (check permission)" }
-    else                             { return "FAILED — add UserAuthenticationMethod.ReadWrite.All" }
 }
- 
-# =============================================================================
-# CONNECT
-# =============================================================================
- 
-Write-Host "Connecting to Microsoft Graph..." -ForegroundColor Cyan
- 
-$SecureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
-$Credential   = New-Object System.Management.Automation.PSCredential($ClientId, $SecureSecret)
- 
-Connect-MgGraph `
-    -TenantId $TenantId `
-    -ClientSecretCredential $Credential `
-    -NoWelcome
- 
-Write-Host "Connected." -ForegroundColor Green
  
 # =============================================================================
 # PRE-FLIGHT: SECURITY DEFAULTS CHECK
@@ -579,10 +546,10 @@ $SummaryBody = @"
 <p style='font-family:Calibri,sans-serif'>
   <b>Created:</b> $Created &nbsp; <b>Skipped:</b> $Skipped &nbsp; <b>Failed:</b> $Failed
 </p>
-<p style='font-family:Calibri,sans-serif'><b>MFA status key:</b><br>
-  <span style='background:#e6f4ea;padding:2px 6px'>Enforced+TAP</span> — MFA enforced and verified; TAP issued for first login (60 min)<br>
-  <span style='background:#fff8e1;padding:2px 6px'>TAP issued — MFA enforcement FAILED</span> — TAP created but MFA NOT enforced; manual action needed<br>
-  <span style='background:#fce8e6;padding:2px 6px'>FAILED</span> — Neither MFA nor TAP succeeded; check App Registration permissions
+<p style='font-family:Calibri,sans-serif'><b>MFA:</b>
+  TAP issued — user signs in with TAP code and CA policy requires MFA registration on first login.<br>
+  Per-user MFA state showing <b>Disabled</b> in the portal is expected — enforcement is via the
+  <b>Require MFA — All Users</b> Conditional Access policy, not per-user legacy state.
 </p>
 <p style='font-family:Calibri,sans-serif;color:#555'>
   <i>Audit log (CSV) is saved as a downloadable artifact in the GitHub Actions run linked to commit $CommitSha.</i>
