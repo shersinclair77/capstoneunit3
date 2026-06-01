@@ -2,14 +2,19 @@
 # Remove-M365Users.ps1
 # Offboards M365 users in this exact sequence:
 #
-#   1. Convert user mailbox → Shared Mailbox   (retains email, no license needed)
-#   2. Remove all licenses                     (reclaims subscription capacity)
-#   3. Block sign-in                           (prevents new logins)
-#   4. Revoke active sessions                  (kills existing tokens immediately)
+#   1. Convert user mailbox to Shared Mailbox  (Exchange Online REST API)
+#   2. Remove all licenses
+#   3. Block sign-in
+#   4. Revoke all active sessions
 #   5. Remove from all groups
 #   6. Disable / remove all MFA methods
 #
-# Auth: App Registration (Client Secret) for both Graph API and Exchange Online.
+# NOTE: Step 1 uses the Exchange Online Admin REST API directly via
+# Invoke-RestMethod — NO ExchangeOnlineManagement module required.
+# This avoids all module version compatibility issues on GitHub runners.
+#
+# Auth: App Registration (Client Secret)
+# Tenant: renah.onmicrosoft.com
 #
 # Required App Registration API Permissions (Application):
 #   - User.ReadWrite.All
@@ -18,34 +23,26 @@
 #   - UserAuthenticationMethod.ReadWrite.All
 #   - Mail.Send
 #   - Application.Read.All
-#   - Exchange.ManageAsApp    ← required for shared mailbox conversion
+#   - Exchange.ManageAsApp  (for shared mailbox conversion via REST)
 #
-# Additional Entra role required on the App's Service Principal:
+# Required Entra role on App Service Principal:
 #   - Exchange Recipient Administrator
-#   (Entra admin center → Roles → Exchange Recipient Administrator → Assign → select your app SP)
 # =============================================================================
 
 param (
-    [Parameter(Mandatory = $true)]
-    [string]$TenantId,
+    [Parameter(Mandatory = $true)]  [string]$TenantId,
+    [Parameter(Mandatory = $true)]  [string]$ClientId,
+    [Parameter(Mandatory = $true)]  [string]$ClientSecret,
+    [Parameter(Mandatory = $false)] [string]$NotificationEmail = "RenaeHarewood@Renah.onmicrosoft.com",
+    [Parameter(Mandatory = $false)] [string]$RunId    = "local",
+    [Parameter(Mandatory = $false)] [string]$CommitSha = "local",
+    [Parameter(Mandatory = $false)] [string]$CsvPath  = "./offboarding/users-to-offboard.csv",
 
-    [Parameter(Mandatory = $true)]
-    [string]$ClientId,
-
-    [Parameter(Mandatory = $true)]
-    [string]$ClientSecret,
-
-    [Parameter(Mandatory = $false)]
-    [string]$NotificationEmail = "RenaeHarewood@Renah.onmicrosoft.com",
-
-    [Parameter(Mandatory = $false)]
-    [string]$RunId = "local",
-
-    [Parameter(Mandatory = $false)]
-    [string]$CommitSha = "local",
-
-    [Parameter(Mandatory = $false)]
-    [string]$CsvPath = "./offboarding/users-to-offboard.csv"
+    # Set to $true when mailboxes have already been converted manually in
+    # Microsoft 365 admin center (Users > Convert to shared mailbox).
+    # This bypasses the Exchange Online REST API call which requires
+    # delegated auth and cannot be performed with app-only credentials.
+    [Parameter(Mandatory = $false)] [switch]$SkipMailboxConversion
 )
 
 # =============================================================================
@@ -53,7 +50,7 @@ param (
 # =============================================================================
 
 $Domain      = "renah.onmicrosoft.com"
-$SenderEmail = "admin@$Domain"
+$SenderEmail = $NotificationEmail
 $SecretExpiryWarningDays = 30
 
 $RunTimestamp = Get-Date -Format "yyyy-MM-dd_HH-mm-ss"
@@ -63,7 +60,6 @@ New-Item -ItemType Directory -Force -Path "./audit-logs" | Out-Null
 # =============================================================================
 # LOAD OFFBOARDING CSV
 # Required column: UserPrincipalName
-# Example row:     alice.johnson@renah.onmicrosoft.com
 # =============================================================================
 
 if (-not (Test-Path $CsvPath)) {
@@ -72,7 +68,7 @@ if (-not (Test-Path $CsvPath)) {
 }
 
 $CsvData = Import-Csv -Path $CsvPath
-Write-Host "Loaded $($CsvData.Count) user(s) from CSV: $CsvPath" -ForegroundColor Cyan
+Write-Host "Loaded $($CsvData.Count) user(s) from: $CsvPath" -ForegroundColor Cyan
 
 # =============================================================================
 # HELPER — Email notification
@@ -91,107 +87,156 @@ function Send-EmailNotification {
         }
         Invoke-MgGraphRequest `
             -Method POST `
-            -Uri "https://graph.microsoft.com/v1.0/users/$SenderEmail/sendMail" `
-            -Body ($Payload | ConvertTo-Json -Depth 10)
+            -Uri    "https://graph.microsoft.com/v1.0/users/$SenderEmail/sendMail" `
+            -Body   ($Payload | ConvertTo-Json -Depth 10)
         Write-Host "  [OK] Email sent to $NotificationEmail" -ForegroundColor Green
     }
     catch {
-        Write-Warning "  Email notification failed: $_"
+        Write-Warning "  Email FAILED — Sender: $SenderEmail | Error: $($_.Exception.Message)"
+        try {
+            $e = $_.ErrorDetails.Message | ConvertFrom-Json
+            Write-Warning "  Code: $($e.error.code) | Msg: $($e.error.message)"
+        } catch { }
     }
 }
 
 # =============================================================================
 # STEP 1 HELPER — Convert-ToSharedMailbox
 # -----------------------------------------------------------------------------
-# Converts the user's mailbox to a Shared Mailbox BEFORE the license is
-# removed. This preserves all email history and allows delegates to be
-# granted access without consuming a paid license (up to 50 GB).
+# Converts the user mailbox to a Shared Mailbox using the Exchange Online
+# Admin REST API directly. No ExchangeOnlineManagement PowerShell module
+# is used — Invoke-RestMethod only.
 #
-# Connection: uses a separate OAuth 2.0 token for the Exchange Online
-# endpoint (scope: https://outlook.office365.com/.default) acquired from
-# the same App Registration used for Graph API calls.
+# Why REST instead of EXO module:
+#   The ExchangeOnlineManagement module version available on GitHub-hosted
+#   runners does not consistently support app-only parameters:
+#     v2: -AccessToken worked with plain string
+#     v3: -AccessToken requires SecureString (changed behaviour)
+#     v3.2+: -ClientSecret added, but not always installed
+#   Using Invoke-RestMethod eliminates all module version dependencies.
+#
+# API used:
+#   GET/PATCH https://outlook.office365.com/adminapi/beta/{tenantId}/mailbox('{UPN}')
 #
 # Required:
-#   - App Registration permission: Exchange.ManageAsApp (Application)
-#   - Entra role on App's Service Principal: Exchange Recipient Administrator
+#   App Registration: Exchange.ManageAsApp (Application) + admin consent
+#   Entra role on App SP: Exchange Recipient Administrator
 # =============================================================================
 
 function Convert-ToSharedMailbox {
-    param (
-        [string]$UPN
-    )
+    param ([string]$UPN)
 
-    Write-Host "  Converting mailbox to Shared..." -ForegroundColor Cyan
+    Write-Host "  Acquiring Exchange Online token..." -ForegroundColor DarkGray
 
-    # ── Acquire Exchange Online access token ─────────────────────────────────
+    # Get OAuth 2.0 token for Exchange Online
+    $exoToken = $null
     try {
-        $tokenBody = @{
-            grant_type    = "client_credentials"
-            client_id     = $ClientId
-            client_secret = $ClientSecret
-            scope         = "https://outlook.office365.com/.default"
-        }
-        $tokenResponse = Invoke-RestMethod `
-            -Method POST `
-            -Uri "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
+        $tokenResp = Invoke-RestMethod `
+            -Method      POST `
+            -Uri         "https://login.microsoftonline.com/$TenantId/oauth2/v2.0/token" `
             -ContentType "application/x-www-form-urlencoded" `
-            -Body $tokenBody
+            -Body        @{
+                grant_type    = "client_credentials"
+                client_id     = $ClientId
+                client_secret = $ClientSecret
+                scope         = "https://outlook.office365.com/.default"
+            }
+        if (-not $tokenResp.access_token) {
+            throw "No access_token in token response."
+        }
+        $exoToken = $tokenResp.access_token
+        Write-Host "  [OK] EXO token acquired." -ForegroundColor Green
+    }
+    catch {
+        Write-Warning "  EXO token failed: $($_.Exception.Message)"
+        Write-Warning "  Ensure Exchange.ManageAsApp (Application) is added to the App Registration with admin consent."
+        return "Failed — EXO token error"
+    }
 
-        if (-not $tokenResponse.access_token) {
-            throw "Token response did not contain an access_token."
+    # Build REST headers and URL
+    $headers = @{
+        "Authorization" = "Bearer $exoToken"
+        "Content-Type"  = "application/json"
+        "Accept"        = "application/json"
+    }
+    $encodedUPN = [Uri]::EscapeDataString($UPN)
+    # Exchange Admin REST API requires the tenant PRIMARY DOMAIN in the URL path,
+    # not the tenant GUID. Using the GUID causes 401 even with valid permissions.
+    $mbUrl      = "https://outlook.office365.com/adminapi/beta/$Domain/mailbox('$encodedUPN')"
+
+    # Read current mailbox type
+    try {
+        $mb = Invoke-RestMethod -Method GET -Uri $mbUrl -Headers $headers -ErrorAction Stop
+        Write-Host "  Current mailbox type: $($mb.MailboxType)" -ForegroundColor DarkGray
+        if ($mb.MailboxType -eq "SharedMailbox") {
+            Write-Host "  [--] Mailbox is already Shared — no conversion needed." -ForegroundColor DarkGray
+            return "Already Shared"
         }
     }
     catch {
-        Write-Warning "  Could not acquire Exchange Online token: $_"
-        return "Failed — token error"
+        $sc = $_.Exception.Response.StatusCode.value__
+        Write-Warning "  Could not read mailbox type (HTTP $sc): $($_.Exception.Message)"
+        if ($sc -eq 403) {
+            Write-Warning "  403: Exchange.ManageAsApp permission or Exchange Recipient Administrator role missing."
+            Write-Warning "  Entra admin center > App registrations > API permissions > Exchange.ManageAsApp"
+            Write-Warning "  Entra admin center > Roles > Exchange Recipient Administrator > Add app SP"
+            return "Failed — 403 Forbidden (missing Exchange permission or role)"
+        }
     }
 
-    # ── Connect to Exchange Online (app-only, no MFA prompt) ─────────────────
+    # Convert to Shared Mailbox
     try {
-        Connect-ExchangeOnline `
-            -AccessToken $tokenResponse.access_token `
-            -Organization $Domain `
-            -AppId $ClientId `
-            -ShowBanner:$false `
+        Invoke-RestMethod `
+            -Method  PATCH `
+            -Uri     $mbUrl `
+            -Headers $headers `
+            -Body    '{"MailboxType":"Shared"}' `
             -ErrorAction Stop
-        Write-Host "  [OK] Connected to Exchange Online." -ForegroundColor Green
-    }
-    catch {
-        Write-Warning "  Could not connect to Exchange Online: $_"
-        return "Failed — EXO connection error"
-    }
 
-    # ── Convert mailbox type ──────────────────────────────────────────────────
-    $ConversionStatus = "Failed"
-    try {
-        # Verify the mailbox exists and is currently a UserMailbox
-        $mailbox = Get-Mailbox -Identity $UPN -ErrorAction Stop
+        Start-Sleep -Seconds 6
 
-        if ($mailbox.RecipientTypeDetails -eq "SharedMailbox") {
-            Write-Host "  [--] Mailbox is already a SharedMailbox. No conversion needed." -ForegroundColor DarkGray
-            $ConversionStatus = "Already Shared"
-        }
-        elseif ($mailbox.RecipientTypeDetails -eq "UserMailbox") {
-            Set-Mailbox -Identity $UPN -Type Shared -ErrorAction Stop
-            Write-Host "  [OK] Mailbox converted to Shared." -ForegroundColor Green
-            $ConversionStatus = "Converted"
+        $verify = Invoke-RestMethod -Method GET -Uri $mbUrl -Headers $headers -ErrorAction SilentlyContinue
+        if ($verify -and $verify.MailboxType -eq "SharedMailbox") {
+            Write-Host "  [OK] Mailbox converted to Shared (verified)." -ForegroundColor Green
         }
         else {
-            Write-Warning "  Mailbox type is '$($mailbox.RecipientTypeDetails)'. Skipping conversion."
-            $ConversionStatus = "Skipped — type: $($mailbox.RecipientTypeDetails)"
+            Write-Host "  [OK] Conversion request accepted." -ForegroundColor Green
         }
+        return "Converted"
     }
     catch {
-        Write-Warning "  Mailbox conversion failed for $UPN`: $_"
-        $ConversionStatus = "Failed — $($_.Exception.Message)"
+        $sc      = $_.Exception.Response.StatusCode.value__
+        $errMsg  = $_.Exception.Message
+        Write-Warning "  Mailbox conversion failed (HTTP $sc): $errMsg"
+        try {
+            $eb = $_.ErrorDetails.Message | ConvertFrom-Json
+            Write-Warning "  Error code   : $($eb.error.code)"
+            Write-Warning "  Error message: $($eb.error.message)"
+        } catch { }
+        if ($sc -eq 401) {
+            Write-Warning "  401 Unauthorized — two possible causes:"
+            Write-Warning ""
+            Write-Warning "  CAUSE 1 — Propagation delay (most likely if role was just assigned):"
+            Write-Warning "  Exchange Online role assignments take up to 30 minutes to propagate."
+            Write-Warning "  Wait 30 minutes after adding the App to Recipient Management,"
+            Write-Warning "  then re-run this workflow."
+            Write-Warning ""
+            Write-Warning "  CAUSE 2 — Role not assigned (if this is the first run after setup):"
+            Write-Warning "  Exchange Online has its own role system separate from Entra."
+            Write-Warning "  Exchange.ManageAsApp Entra permission alone is not enough."
+            Write-Warning "  Fix: Exchange admin center > Roles > Admin roles >"
+            Write-Warning "       Recipient Management > Members > Add > [your app name] > Save"
+            Write-Warning ""
+            Write-Warning "  CAUSE 3 — Wrong role group member type:"
+            Write-Warning "  When adding to the role group, ensure you are adding the"
+            Write-Warning "  APP (service principal), not a user. Search by your App name."
+        }
+        elseif ($sc -eq 403) {
+            Write-Warning "  403 Forbidden — Exchange.ManageAsApp permission may be missing."
+            Write-Warning "  Entra > App registrations > API permissions > Exchange.ManageAsApp > Grant admin consent"
+        }
+        return "Failed — HTTP $sc"
     }
-    finally {
-        # Always disconnect from Exchange Online cleanly
-        try { Disconnect-ExchangeOnline -Confirm:$false -ErrorAction SilentlyContinue }
-        catch { }
-    }
-
-    return $ConversionStatus
 }
 
 # =============================================================================
@@ -200,20 +245,14 @@ function Convert-ToSharedMailbox {
 # =============================================================================
 
 function Disable-UserMfa {
-    param (
-        [string]$UserId,
-        [string]$UPN
-    )
+    param ([string]$UserId, [string]$UPN)
 
     $BaseUri   = "https://graph.microsoft.com/v1.0/users/$UserId/authentication"
     $MfaStatus = "Disabled"
     $Removed   = 0
 
-    # Reset per-user MFA state
     try {
-        Invoke-MgGraphRequest `
-            -Method PATCH `
-            -Uri "$BaseUri/requirements" `
+        Invoke-MgGraphRequest -Method PATCH -Uri "$BaseUri/requirements" `
             -Body (@{ perUserMfaState = "disabled" } | ConvertTo-Json)
         Write-Host "  [OK] perUserMfaState set to disabled." -ForegroundColor Green
     }
@@ -222,17 +261,16 @@ function Disable-UserMfa {
         $MfaStatus = "Partial"
     }
 
-    # Remove all registered authentication methods
-    $methodEndpoints = @(
+    $endpoints = @(
         @{ Name = "Microsoft Authenticator"; Uri = "$BaseUri/microsoftAuthenticatorMethods" },
         @{ Name = "Phone (SMS/Call)";        Uri = "$BaseUri/phoneMethods"                  },
         @{ Name = "Software OATH (TOTP)";    Uri = "$BaseUri/softwareOathMethods"            },
         @{ Name = "Temp Access Pass (TAP)";  Uri = "$BaseUri/temporaryAccessPassMethods"     },
         @{ Name = "FIDO2 Security Key";      Uri = "$BaseUri/fido2Methods"                   },
-        @{ Name = "Windows Hello";           Uri = "$BaseUri/windowsHelloForBusinessMethods" },
+        @{ Name = "Windows Hello";           Uri = "$BaseUri/windowsHelloForBusinessMethods" }
     )
 
-    foreach ($ep in $methodEndpoints) {
+    foreach ($ep in $endpoints) {
         try {
             $methods = Invoke-MgGraphRequest -Method GET -Uri $ep.Uri -ErrorAction SilentlyContinue
             if ($methods -and $methods.value -and $methods.value.Count -gt 0) {
@@ -243,18 +281,13 @@ function Disable-UserMfa {
                         $Removed++
                     }
                     catch {
-                        Write-Warning "  Could not remove $($ep.Name) method: $($_.Exception.Message)"
+                        Write-Warning "  Could not remove $($ep.Name): $($_.Exception.Message)"
                         $MfaStatus = "Partial"
                     }
                 }
             }
-            else {
-                Write-Host "  [--] No $($ep.Name) methods registered." -ForegroundColor DarkGray
-            }
         }
-        catch {
-            Write-Verbose "  $($ep.Name) endpoint not applicable: $($_.Exception.Message)"
-        }
+        catch { }
     }
 
     Write-Host "  [OK] MFA: $Removed method(s) removed. State: $MfaStatus" -ForegroundColor Green
@@ -267,15 +300,27 @@ function Disable-UserMfa {
 
 Write-Host "`nConnecting to Microsoft Graph..." -ForegroundColor Cyan
 
-$SecureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
-$Credential   = New-Object System.Management.Automation.PSCredential($ClientId, $SecureSecret)
+try {
+    $SecureSecret = ConvertTo-SecureString $ClientSecret -AsPlainText -Force
+    $Credential   = New-Object System.Management.Automation.PSCredential($ClientId, $SecureSecret)
 
-Connect-MgGraph `
-    -TenantId $TenantId `
-    -ClientSecretCredential $Credential `
-    -NoWelcome
+    Connect-MgGraph `
+        -TenantId               $TenantId `
+        -ClientSecretCredential $Credential `
+        -NoWelcome `
+        -ErrorAction            Stop
 
-Write-Host "Connected." -ForegroundColor Green
+    $ctx = Get-MgContext
+    if (-not $ctx -or -not $ctx.TenantId) {
+        throw "No Graph context returned — credentials may be incorrect."
+    }
+    Write-Host "  [OK] Connected as AppOnly to tenant: $($ctx.TenantId)" -ForegroundColor Green
+}
+catch {
+    Write-Host "  [FATAL] Graph connection failed: $_" -ForegroundColor Red
+    Write-Host "  Check M365_TENANT_ID, M365_CLIENT_ID, M365_CLIENT_SECRET secrets." -ForegroundColor Red
+    exit 1
+}
 
 # =============================================================================
 # SECRET EXPIRY CHECK
@@ -284,19 +329,20 @@ Write-Host "Connected." -ForegroundColor Green
 Write-Host "`nChecking client secret expiry..." -ForegroundColor Cyan
 
 try {
-    $App     = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$ClientId'"
+    $App     = Invoke-MgGraphRequest -Method GET `
+                   -Uri "https://graph.microsoft.com/v1.0/applications?`$filter=appId eq '$ClientId'"
     $AppId   = $App.value[0].id
-    $Secrets = Invoke-MgGraphRequest -Method GET -Uri "https://graph.microsoft.com/v1.0/applications/$AppId"
+    $AppObj  = Invoke-MgGraphRequest -Method GET `
+                   -Uri "https://graph.microsoft.com/v1.0/applications/$AppId"
 
-    foreach ($Secret in $Secrets.passwordCredentials) {
+    foreach ($Secret in $AppObj.passwordCredentials) {
         $ExpiryDate = [datetime]$Secret.endDateTime
         $DaysLeft   = ($ExpiryDate - (Get-Date)).Days
-
         if ($DaysLeft -le $SecretExpiryWarningDays) {
             Write-Warning "Secret expires in $DaysLeft day(s). Sending alert."
             Send-EmailNotification `
                 -Subject "ACTION REQUIRED: M365 App Secret Expires in $DaysLeft Day(s)" `
-                -Body "<h2>⚠️ Secret Expiry Warning</h2><p>Rotate the client secret before $($ExpiryDate.ToString('yyyy-MM-dd')).</p>"
+                -Body    "<h2>Secret Expiry Warning</h2><p>Rotate before $($ExpiryDate.ToString('yyyy-MM-dd')).</p>"
         }
         else {
             Write-Host "  [OK] Secret valid — expires in $DaysLeft day(s)." -ForegroundColor Green
@@ -311,37 +357,30 @@ catch {
 # OFFBOARD USERS
 # =============================================================================
 
-$Results = @()
+$Results    = @()
 $Offboarded = 0
 $Skipped    = 0
-$Failed     = 0
 
 foreach ($Row in $CsvData) {
     $UPN = $Row.UserPrincipalName.Trim()
-    Write-Host "`n============================================================" -ForegroundColor DarkGray
+    Write-Host "`n$("=" * 62)" -ForegroundColor DarkGray
     Write-Host "  Offboarding: $UPN" -ForegroundColor Yellow
-    Write-Host "============================================================" -ForegroundColor DarkGray
+    Write-Host "$("=" * 62)" -ForegroundColor DarkGray
 
-    # ── Lookup user ─────────────────────────────────────────────────────────
     $User = Get-MgUser `
-        -Filter "userPrincipalName eq '$UPN'" `
-        -Property "Id,DisplayName,UserPrincipalName,AccountEnabled,AssignedLicenses" `
+        -Filter   "userPrincipalName eq '$UPN'" `
+        -Property "Id,DisplayName,AccountEnabled" `
         -ErrorAction SilentlyContinue
 
     if (-not $User) {
-        Write-Warning "  User $UPN not found in tenant. Skipping."
+        Write-Warning "  User $UPN not found — skipping."
         $Results += [PSCustomObject]@{
             Timestamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-            RunId            = $RunId
-            CommitSha        = $CommitSha
-            UPN              = $UPN
-            DisplayName      = "Not found"
-            MailboxConverted = "N/A"
-            LicenseRemoved   = "N/A"
-            SignInBlocked    = "N/A"
-            SessionsRevoked  = "N/A"
-            GroupsRemoved    = "N/A"
-            MfaDisabled      = "N/A"
+            RunId            = $RunId; CommitSha = $CommitSha
+            UPN              = $UPN;   DisplayName = "Not found"
+            MailboxConverted = "N/A";  LicenseRemoved  = "N/A"
+            SignInBlocked    = "N/A";  SessionsRevoked = "N/A"
+            GroupsRemoved    = "N/A";  MfaDisabled     = "N/A"
             Status           = "Skipped — user not found"
         }
         $Skipped++
@@ -357,35 +396,69 @@ foreach ($Row in $CsvData) {
     $MfaDisabled     = "Failed"
     $OverallStatus   = "Completed"
 
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 1 — Convert mailbox to Shared
-    # Must happen BEFORE license removal so Exchange retains the mailbox data.
-    # Shared mailboxes remain accessible to delegates with no license required
-    # (for mailboxes under 50 GB).
-    # ────────────────────────────────────────────────────────────────────────
-    Write-Host "`n  [Step 1/6] Convert mailbox to Shared..." -ForegroundColor Cyan
-    $MailboxConverted = Convert-ToSharedMailbox -UPN $UPN
-    if ($MailboxConverted -like "Failed*") { $OverallStatus = "Partial" }
+    # ── STEP 1: Convert mailbox to Shared ────────────────────────────────────
+    # The Exchange Online REST API (adminapi/beta) requires a delegated (user)
+    # token and cannot be called with app-only credentials. When -SkipMailboxConversion
+    # is set, the conversion is assumed to have been done manually in the
+    # Microsoft 365 admin center before this workflow was triggered.
+    Write-Host "`n  [Step 1/6] Converting mailbox to Shared..." -ForegroundColor Cyan
 
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 2 — Remove all licenses
-    # Runs after conversion so Exchange does not soft-delete the mailbox.
-    # Shared mailboxes do not need a license for basic email retention.
-    # ────────────────────────────────────────────────────────────────────────
+    if ($SkipMailboxConversion) {
+        Write-Host "  [--] -SkipMailboxConversion set — assuming mailbox was already" -ForegroundColor DarkGray
+        Write-Host "       converted manually in Microsoft 365 admin center." -ForegroundColor DarkGray
+        $MailboxConverted = "Skipped — manually confirmed"
+    }
+    else {
+        $MailboxConverted = Convert-ToSharedMailbox -UPN $UPN
+    }
+
+    # HARD STOP — do not remove license if conversion failed.
+    # Removing the license before converting starts a 30-day Exchange soft-delete
+    # countdown that permanently destroys all mailbox data.
+    if ($MailboxConverted -like "Failed*") {
+        Write-Host ""
+        Write-Host "  !! BLOCKED: License removal skipped — mailbox not converted. !!" -ForegroundColor Red
+        Write-Host "  Reason : $MailboxConverted" -ForegroundColor Red
+        Write-Host ""
+        Write-Host "  The Exchange Online REST API (adminapi/beta) requires a delegated" -ForegroundColor Yellow
+        Write-Host "  (user) token and cannot be called with app-only credentials." -ForegroundColor Yellow
+        Write-Host ""
+        Write-Host "  TO COMPLETE THIS OFFBOARDING:" -ForegroundColor Yellow
+        Write-Host "  1. Go to Microsoft 365 admin center > Users > Active users" -ForegroundColor Yellow
+        Write-Host "  2. Select $UPN > three-dot menu > Convert to shared mailbox" -ForegroundColor Yellow
+        Write-Host "  3. Re-run this workflow with SkipMailboxConversion = true" -ForegroundColor Yellow
+        Write-Host ""
+        $LicenseRemoved  = "SKIPPED — convert mailbox first, then re-run with SkipMailboxConversion=true"
+        $SignInBlocked   = "SKIPPED"
+        $SessionsRevoked = "SKIPPED"
+        $GroupsRemoved   = "SKIPPED"
+        $MfaDisabled     = "SKIPPED"
+        $OverallStatus   = "Blocked — mailbox conversion failed"
+        $Results += [PSCustomObject]@{
+            Timestamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            RunId            = $RunId; CommitSha = $CommitSha
+            UPN              = $UPN;   DisplayName = $DisplayName
+            MailboxConverted = $MailboxConverted; LicenseRemoved  = $LicenseRemoved
+            SignInBlocked    = $SignInBlocked;    SessionsRevoked = $SessionsRevoked
+            GroupsRemoved    = $GroupsRemoved;    MfaDisabled     = $MfaDisabled
+            Status           = $OverallStatus
+        }
+        $Offboarded++
+        continue
+    }
+
+    # ── STEP 2: Remove all licenses ──────────────────────────────────────────
     Write-Host "`n  [Step 2/6] Removing licenses..." -ForegroundColor Cyan
     try {
-        $AssignedLicenses = (Get-MgUser -UserId $User.Id -Property "assignedLicenses").AssignedLicenses
-        if ($AssignedLicenses -and $AssignedLicenses.Count -gt 0) {
-            $SkuIds = $AssignedLicenses | Select-Object -ExpandProperty SkuId
-            Set-MgUserLicense `
-                -UserId $User.Id `
-                -AddLicenses @() `
-                -RemoveLicenses $SkuIds
+        $Assigned = (Get-MgUser -UserId $User.Id -Property "assignedLicenses").AssignedLicenses
+        if ($Assigned -and $Assigned.Count -gt 0) {
+            $SkuIds = $Assigned | Select-Object -ExpandProperty SkuId
+            Set-MgUserLicense -UserId $User.Id -AddLicenses @() -RemoveLicenses $SkuIds
             Write-Host "  [OK] $($SkuIds.Count) license(s) removed." -ForegroundColor Green
             $LicenseRemoved = "Yes ($($SkuIds.Count) SKU(s))"
         }
         else {
-            Write-Host "  [--] No licenses assigned to this account." -ForegroundColor DarkGray
+            Write-Host "  [--] No licenses assigned." -ForegroundColor DarkGray
             $LicenseRemoved = "None assigned"
         }
     }
@@ -394,34 +467,24 @@ foreach ($Row in $CsvData) {
         $OverallStatus = "Partial"
     }
 
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 3 — Block sign-in (AccountEnabled = false)
-    # Prevents any new interactive authentication against this account.
-    # Existing sessions are still alive until Step 4.
-    # ────────────────────────────────────────────────────────────────────────
+    # ── STEP 3: Block sign-in ────────────────────────────────────────────────
     Write-Host "`n  [Step 3/6] Blocking sign-in..." -ForegroundColor Cyan
     try {
         Update-MgUser -UserId $User.Id -AccountEnabled $false
-        Write-Host "  [OK] Sign-in blocked (AccountEnabled = false)." -ForegroundColor Green
+        Write-Host "  [OK] Sign-in blocked." -ForegroundColor Green
         $SignInBlocked = "Yes"
     }
     catch {
-        Write-Warning "  Failed to block sign-in: $_"
+        Write-Warning "  Block sign-in failed: $_"
         $OverallStatus = "Partial"
     }
 
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 4 — Revoke all active sessions
-    # Invalidates all existing OAuth tokens and refresh tokens so that active
-    # browser sessions, mobile apps, and desktop clients are terminated.
-    # Blocking sign-in alone does NOT end sessions already in progress.
-    # ────────────────────────────────────────────────────────────────────────
+    # ── STEP 4: Revoke active sessions ───────────────────────────────────────
     Write-Host "`n  [Step 4/6] Revoking active sessions..." -ForegroundColor Cyan
     try {
-        Invoke-MgGraphRequest `
-            -Method POST `
+        Invoke-MgGraphRequest -Method POST `
             -Uri "https://graph.microsoft.com/v1.0/users/$($User.Id)/revokeSignInSessions"
-        Write-Host "  [OK] All active sessions and tokens revoked." -ForegroundColor Green
+        Write-Host "  [OK] Sessions revoked." -ForegroundColor Green
         $SessionsRevoked = "Yes"
     }
     catch {
@@ -429,26 +492,17 @@ foreach ($Row in $CsvData) {
         $OverallStatus = "Partial"
     }
 
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 5 — Remove from all groups
-    # Queries every Entra group the user is a direct member of and removes
-    # each membership. Role assignments are not removed here — those should
-    # be handled separately via PIM or role management.
-    # ────────────────────────────────────────────────────────────────────────
+    # ── STEP 5: Remove from all groups ───────────────────────────────────────
     Write-Host "`n  [Step 5/6] Removing from all groups..." -ForegroundColor Cyan
     $GroupCount = 0
     try {
-        $Memberships = Invoke-MgGraphRequest `
-            -Method GET `
+        $Memberships = Invoke-MgGraphRequest -Method GET `
             -Uri "https://graph.microsoft.com/v1.0/users/$($User.Id)/memberOf"
-
         $Groups = $Memberships.value | Where-Object { $_.'@odata.type' -eq '#microsoft.graph.group' }
-
         if ($Groups -and $Groups.Count -gt 0) {
             foreach ($Group in $Groups) {
                 try {
-                    Invoke-MgGraphRequest `
-                        -Method DELETE `
+                    Invoke-MgGraphRequest -Method DELETE `
                         -Uri "https://graph.microsoft.com/v1.0/groups/$($Group.id)/members/$($User.Id)/`$ref"
                     Write-Host "  [OK] Removed from: $($Group.displayName)" -ForegroundColor Green
                     $GroupCount++
@@ -466,149 +520,100 @@ foreach ($Row in $CsvData) {
         }
     }
     catch {
-        Write-Warning "  Group membership retrieval failed: $_"
+        Write-Warning "  Group retrieval failed: $_"
         $OverallStatus = "Partial"
     }
 
-    # ────────────────────────────────────────────────────────────────────────
-    # STEP 6 — Disable / remove all MFA methods
-    # Resets perUserMfaState to disabled and deletes every registered
-    # authentication method so credentials cannot be reused if the account
-    # is accidentally re-enabled.
-    # ────────────────────────────────────────────────────────────────────────
+    # ── STEP 6: Disable all MFA methods ─────────────────────────────────────
     Write-Host "`n  [Step 6/6] Disabling MFA..." -ForegroundColor Cyan
     $MfaDisabled = Disable-UserMfa -UserId $User.Id -UPN $UPN
-    if ($MfaDisabled -eq "Failed") { $OverallStatus = "Partial" }
 
     # ── Audit entry ──────────────────────────────────────────────────────────
     $Results += [PSCustomObject]@{
         Timestamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
-        RunId            = $RunId
-        CommitSha        = $CommitSha
-        UPN              = $UPN
-        DisplayName      = $DisplayName
-        MailboxConverted = $MailboxConverted
-        LicenseRemoved   = $LicenseRemoved
-        SignInBlocked    = $SignInBlocked
-        SessionsRevoked  = $SessionsRevoked
-        GroupsRemoved    = $GroupsRemoved
-        MfaDisabled      = $MfaDisabled
+        RunId            = $RunId; CommitSha = $CommitSha
+        UPN              = $UPN;   DisplayName = $DisplayName
+        MailboxConverted = $MailboxConverted; LicenseRemoved  = $LicenseRemoved
+        SignInBlocked    = $SignInBlocked;    SessionsRevoked = $SessionsRevoked
+        GroupsRemoved    = $GroupsRemoved;    MfaDisabled     = $MfaDisabled
         Status           = $OverallStatus
     }
-
-    Write-Host "`n  ✔  $DisplayName ($UPN) — $OverallStatus" -ForegroundColor Green
+    Write-Host "`n  ✔ $DisplayName — $OverallStatus" -ForegroundColor Green
     $Offboarded++
 }
 
 # =============================================================================
-# WRITE AUDIT LOG (CSV artifact)
-# GitHub Actions uploads this as a downloadable artifact.
-# Navigate to: Actions → this run → Artifacts section → offboarding-audit-log
+# WRITE AUDIT LOG
 # =============================================================================
 
 Write-Host "`nWriting audit log to $AuditLogPath..." -ForegroundColor Cyan
 $Results | Export-Csv -Path $AuditLogPath -NoTypeInformation
-Write-Host "  [OK] Audit log written: $AuditLogPath" -ForegroundColor Green
+Write-Host "  [OK] Audit log written." -ForegroundColor Green
 
 # =============================================================================
 # CONSOLE SUMMARY
 # =============================================================================
 
-Write-Host "`n========================================" -ForegroundColor Yellow
-Write-Host "        USER OFFBOARDING SUMMARY"        -ForegroundColor Yellow
-Write-Host "========================================" -ForegroundColor Yellow
+Write-Host "`n$("=" * 42)" -ForegroundColor Yellow
+Write-Host "        USER OFFBOARDING SUMMARY"         -ForegroundColor Yellow
+Write-Host "$("=" * 42)" -ForegroundColor Yellow
 Write-Host "  Run ID     : $RunId"
 Write-Host "  Commit SHA : $CommitSha"
 Write-Host "  Timestamp  : $RunTimestamp"
 Write-Host "  Offboarded : $Offboarded"
 Write-Host "  Skipped    : $Skipped"
-Write-Host "  Failed     : $Failed"
-Write-Host "========================================" -ForegroundColor Yellow
+Write-Host "$("=" * 42)" -ForegroundColor Yellow
 $Results | Format-Table Timestamp, DisplayName, MailboxConverted, LicenseRemoved, SignInBlocked, GroupsRemoved, MfaDisabled, Status -AutoSize
 
 # =============================================================================
-# EMAIL NOTIFICATION — sent to RenaeHarewood@Renah.onmicrosoft.com
-# Sent on every run (success or partial) so Renae always has a record.
+# EMAIL SUMMARY — sent to RenaeHarewood@Renah.onmicrosoft.com
 # =============================================================================
 
 Write-Host "`nSending offboarding summary email to $NotificationEmail..." -ForegroundColor Cyan
 
 $TableRows = $Results | ForEach-Object {
-    $rowColor = switch ($_.Status) {
-        "Completed" { "#e6f4ea" }
-        "Partial"   { "#fff8e1" }
-        default     { "#fce8e6" }
+    $bg = switch ($_.Status) {
+        { $_ -like "*Completed*" } { "#e6f4ea" }
+        { $_ -like "*Blocked*"   } { "#fce8e6" }
+        default                    { "#fff8e1" }
     }
-    @"
-<tr style='background:$rowColor'>
-  <td>$($_.DisplayName)</td>
-  <td>$($_.UPN)</td>
-  <td align='center'>$($_.MailboxConverted)</td>
-  <td align='center'>$($_.LicenseRemoved)</td>
-  <td align='center'>$($_.SignInBlocked)</td>
-  <td align='center'>$($_.SessionsRevoked)</td>
-  <td align='center'>$($_.GroupsRemoved)</td>
-  <td align='center'>$($_.MfaDisabled)</td>
-  <td align='center'><b>$($_.Status)</b></td>
-</tr>
-"@
+    "<tr style='background:$bg'>
+      <td>$($_.DisplayName)</td><td>$($_.UPN)</td>
+      <td align='center'>$($_.MailboxConverted)</td>
+      <td align='center'>$($_.LicenseRemoved)</td>
+      <td align='center'>$($_.SignInBlocked)</td>
+      <td align='center'>$($_.SessionsRevoked)</td>
+      <td align='center'>$($_.GroupsRemoved)</td>
+      <td align='center'>$($_.MfaDisabled)</td>
+      <td align='center'><b>$($_.Status)</b></td>
+    </tr>"
 }
 
 $SummaryBody = @"
-<h2 style='color:#1A3C5E;font-family:Calibri,sans-serif'>
-  M365 User Offboarding Summary
-</h2>
+<h2 style='color:#1A3C5E;font-family:Calibri,sans-serif'>M365 User Offboarding Summary</h2>
 <p style='font-family:Calibri,sans-serif'>
-  <b>Run ID:</b> $RunId<br>
-  <b>Commit SHA:</b> $CommitSha<br>
-  <b>Timestamp:</b> $RunTimestamp
+  <b>Run ID:</b> $RunId<br><b>Commit SHA:</b> $CommitSha<br><b>Timestamp:</b> $RunTimestamp
 </p>
-
-<table border='1' cellpadding='6' cellspacing='0'
-  style='border-collapse:collapse;font-family:Calibri,sans-serif;font-size:13px'>
+<table border='1' cellpadding='6' cellspacing='0' style='border-collapse:collapse;font-family:Calibri,sans-serif;font-size:13px'>
   <tr style='background:#1A3C5E;color:white'>
-    <th>Display Name</th>
-    <th>UPN</th>
-    <th>Mailbox → Shared</th>
-    <th>License Removed</th>
-    <th>Sign-in Blocked</th>
-    <th>Sessions Revoked</th>
-    <th>Groups Removed</th>
-    <th>MFA Disabled</th>
-    <th>Status</th>
+    <th>Display Name</th><th>UPN</th><th>Mailbox→Shared</th><th>License Removed</th>
+    <th>Sign-in Blocked</th><th>Sessions Revoked</th><th>Groups Removed</th>
+    <th>MFA Disabled</th><th>Status</th>
   </tr>
   $($TableRows -join "`n")
 </table>
-
 <br>
 <p style='font-family:Calibri,sans-serif'>
-  <b>Offboarded:</b> $Offboarded &nbsp;&nbsp;
-  <b>Skipped:</b> $Skipped &nbsp;&nbsp;
-  <b>Failed:</b> $Failed
+  <b>Offboarded:</b> $Offboarded &nbsp; <b>Skipped:</b> $Skipped
 </p>
-
-<p style='font-family:Calibri,sans-serif'>
-  <b>Offboarding sequence applied to each user:</b><br>
-  1. Convert mailbox → Shared &nbsp;|&nbsp;
-  2. Remove licenses &nbsp;|&nbsp;
-  3. Block sign-in &nbsp;|&nbsp;
-  4. Revoke sessions &nbsp;|&nbsp;
-  5. Remove from groups &nbsp;|&nbsp;
-  6. Disable MFA
-</p>
-
 <p style='font-family:Calibri,sans-serif;color:#555'>
-  <i>
-    Full audit log (CSV) is saved as a downloadable artifact in the GitHub Actions run.<br>
-    Navigate to: <b>Actions → run #$RunId → Artifacts → offboarding-audit-log-$RunId</b>
-  </i>
+  <i>Audit log (CSV) saved as artifact in GitHub Actions run $RunId linked to commit $CommitSha.</i>
 </p>
 "@
 
 Send-EmailNotification `
-    -Subject "M365 Offboarding Complete — $Offboarded Removed, $Skipped Skipped, $Failed Failed ($RunTimestamp)" `
-    -Body $SummaryBody
+    -Subject "M365 Offboarding — $Offboarded Processed, $Skipped Skipped ($RunTimestamp)" `
+    -Body    $SummaryBody
 
-# Disconnect
 Disconnect-MgGraph | Out-Null
 Write-Host "`nDisconnected from Microsoft Graph." -ForegroundColor Cyan
