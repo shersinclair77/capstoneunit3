@@ -93,7 +93,7 @@ jobs:
         run: |
           Set-PSRepository PSGallery -InstallationPolicy Trusted
           Install-Module Microsoft.Graph          -Scope CurrentUser -Force
-          Install-Module ExchangeOnlineManagement -Scope CurrentUser -Force
+          Install-Module ExchangeOnlineManagement -MinimumVersion 3.2.0 -Scope CurrentUser -Force
 
       - name: Run offboarding script
         shell: pwsh
