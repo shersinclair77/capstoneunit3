@@ -157,9 +157,12 @@ function Convert-ToSharedMailbox {
     }
 
     # ── Connect to Exchange Online (app-only, no MFA prompt) ─────────────────
+    # ExchangeOnlineManagement v3+ requires AccessToken as SecureString.
+    # Converting here handles both v2 (plain string) and v3 (SecureString).
     try {
+        $secureToken = $tokenResponse.access_token | ConvertTo-SecureString -AsPlainText -Force
         Connect-ExchangeOnline `
-            -AccessToken $tokenResponse.access_token `
+            -AccessToken $secureToken `
             -Organization $Domain `
             -AppId $ClientId `
             -ShowBanner:$false `
@@ -390,7 +393,49 @@ foreach ($Row in $CsvData) {
     # ────────────────────────────────────────────────────────────────────────
     Write-Host "`n  [Step 1/6] Convert mailbox to Shared..." -ForegroundColor Cyan
     $MailboxConverted = Convert-ToSharedMailbox -UPN $UPN
-    if ($MailboxConverted -like "Failed*") { $OverallStatus = "Partial" }
+
+    # HARD STOP: if conversion failed, do NOT remove the license.
+    # Removing the license before converting starts a 30-day Exchange soft-delete
+    # countdown that permanently deletes all mailbox data. The operator must fix
+    # the Exchange Online connection and re-run before proceeding.
+    if ($MailboxConverted -like "Failed*") {
+        Write-Host ""
+        Write-Host "  ╔══════════════════════════════════════════════════════════════════╗" -ForegroundColor Red
+        Write-Host "  ║  BLOCKED: Mailbox conversion failed for $($UPN.PadRight(34)) ║" -ForegroundColor Red
+        Write-Host "  ║                                                                  ║" -ForegroundColor Red
+        Write-Host "  ║  License removal has been SKIPPED to protect mailbox data.      ║" -ForegroundColor Red
+        Write-Host "  ║  Removing the license before converting would start a 30-day    ║" -ForegroundColor Red
+        Write-Host "  ║  soft-delete countdown in Exchange, permanently deleting all    ║" -ForegroundColor Red
+        Write-Host "  ║  email history.                                                  ║" -ForegroundColor Red
+        Write-Host "  ║                                                                  ║" -ForegroundColor Red
+        Write-Host "  ║  TO FIX:                                                        ║" -ForegroundColor Red
+        Write-Host "  ║  1. Verify Exchange.ManageAsApp permission on App Registration  ║" -ForegroundColor Red
+        Write-Host "  ║  2. Verify Exchange Recipient Administrator role is assigned     ║" -ForegroundColor Red
+        Write-Host "  ║  3. Re-run this workflow — conversion will be retried            ║" -ForegroundColor Red
+        Write-Host "  ║  4. Alternatively, convert manually in Exchange admin center     ║" -ForegroundColor Red
+        Write-Host "  ╚══════════════════════════════════════════════════════════════════╝" -ForegroundColor Red
+        Write-Host ""
+
+        $LicenseRemoved  = "SKIPPED — mailbox not converted (manual action required)"
+        $OverallStatus   = "Partial — license NOT removed, mailbox NOT converted"
+
+        $Results += [PSCustomObject]@{
+            Timestamp        = (Get-Date -Format "yyyy-MM-dd HH:mm:ss")
+            RunId            = $RunId
+            CommitSha        = $CommitSha
+            UPN              = $UPN
+            DisplayName      = $DisplayName
+            MailboxConverted = $MailboxConverted
+            LicenseRemoved   = $LicenseRemoved
+            SignInBlocked    = "Skipped"
+            SessionsRevoked  = "Skipped"
+            GroupsRemoved    = "Skipped"
+            MfaDisabled      = "Skipped"
+            Status           = $OverallStatus
+        }
+        $Offboarded++
+        continue
+    }
 
     # ────────────────────────────────────────────────────────────────────────
     # STEP 2 — Remove all licenses
