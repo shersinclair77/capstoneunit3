@@ -14,9 +14,9 @@
 # Audit log: Actions tab → this run → Artifacts → offboarding-audit-log-{run_id}
 #
 # Secrets required in GitHub repository settings:
-#   TENANT_ID     — Azure AD tenant ID
-#   CLIENT_ID     — App Registration client ID
-#   CLIENT_SECRET — App Registration client secret
+#   M365_TENANT_ID     — Azure AD tenant ID
+#   M365_CLIENT_ID     — App Registration client ID
+#   M365_CLIENT_SECRET — App Registration client secret
 # =============================================================================
 
 name: M365 User Offboarding
@@ -98,14 +98,14 @@ jobs:
       - name: Run offboarding script
         shell: pwsh
         env:
-          TENANT_ID:     ${{ secrets.TENANT_ID }}
-          CLIENT_ID:     ${{ secrets.CLIENT_ID }}
-          CLIENT_SECRET: ${{ secrets.CLIENT_SECRET }}
+          M365_TENANT_ID:     ${{ secrets.M365_TENANT_ID }}
+          M365_CLIENT_ID:     ${{ secrets.M365_CLIENT_ID }}
+          M365_CLIENT_SECRET: ${{ secrets.M365_CLIENT_SECRET }}
         run: |
           ./scripts/Remove-M365Users.ps1 `
-            -TenantId          $env:TENANT_ID `
-            -ClientId          $env:CLIENT_ID `
-            -ClientSecret      $env:CLIENT_SECRET `
+            -TenantId          $env:M365_TENANT_ID `
+            -ClientId          $env:M365_CLIENT_ID `
+            -ClientSecret      $env:M365_CLIENT_SECRET `
             -NotificationEmail "RenaeHarewood@Renah.onmicrosoft.com" `
             -RunId             "${{ github.run_id }}" `
             -CommitSha         "${{ github.sha }}" `
