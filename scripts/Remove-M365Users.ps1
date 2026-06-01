@@ -154,7 +154,9 @@ function Convert-ToSharedMailbox {
         "Accept"        = "application/json"
     }
     $encodedUPN = [Uri]::EscapeDataString($UPN)
-    $mbUrl      = "https://outlook.office365.com/adminapi/beta/$TenantId/mailbox('$encodedUPN')"
+    # Exchange Admin REST API requires the tenant PRIMARY DOMAIN in the URL path,
+    # not the tenant GUID. Using the GUID causes 401 even with valid permissions.
+    $mbUrl      = "https://outlook.office365.com/adminapi/beta/$Domain/mailbox('$encodedUPN')"
 
     # Read current mailbox type
     try {
@@ -205,8 +207,27 @@ function Convert-ToSharedMailbox {
             Write-Warning "  Error code   : $($eb.error.code)"
             Write-Warning "  Error message: $($eb.error.message)"
         } catch { }
-        if ($sc -eq 403) {
-            Write-Warning "  403: Check Exchange.ManageAsApp permission AND Exchange Recipient Administrator role."
+        if ($sc -eq 401) {
+            Write-Warning "  401 Unauthorized — two possible causes:"
+            Write-Warning ""
+            Write-Warning "  CAUSE 1 — Propagation delay (most likely if role was just assigned):"
+            Write-Warning "  Exchange Online role assignments take up to 30 minutes to propagate."
+            Write-Warning "  Wait 30 minutes after adding the App to Recipient Management,"
+            Write-Warning "  then re-run this workflow."
+            Write-Warning ""
+            Write-Warning "  CAUSE 2 — Role not assigned (if this is the first run after setup):"
+            Write-Warning "  Exchange Online has its own role system separate from Entra."
+            Write-Warning "  Exchange.ManageAsApp Entra permission alone is not enough."
+            Write-Warning "  Fix: Exchange admin center > Roles > Admin roles >"
+            Write-Warning "       Recipient Management > Members > Add > [your app name] > Save"
+            Write-Warning ""
+            Write-Warning "  CAUSE 3 — Wrong role group member type:"
+            Write-Warning "  When adding to the role group, ensure you are adding the"
+            Write-Warning "  APP (service principal), not a user. Search by your App name."
+        }
+        elseif ($sc -eq 403) {
+            Write-Warning "  403 Forbidden — Exchange.ManageAsApp permission may be missing."
+            Write-Warning "  Entra > App registrations > API permissions > Exchange.ManageAsApp > Grant admin consent"
         }
         return "Failed — HTTP $sc"
     }
